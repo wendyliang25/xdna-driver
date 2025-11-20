@@ -22,6 +22,7 @@ Options:
   -hello_umq              Hello UMQ Memory Test
   -dir                    Download directory if apply
   -nokmod                 Don't build or install the kernel module
+  -vxdna                  Build vxdna renderer library
 USAGE_END
 }
 
@@ -153,6 +154,7 @@ package=0
 nocmake=0
 verbose=
 skip_kmod=0
+build_vxdna=0
 njobs=`grep -c ^processor /proc/cpuinfo`
 download_dir=
 xrt_install_prefix="/opt/xilinx/xrt"
@@ -202,6 +204,9 @@ while [ $# -gt 0 ]; do
     -nokmod)
       skip_kmod=1
       ;;
+    -vxdna)
+      build_vxdna=1
+      ;;
     -dir)
       download_dir=$2
       shift
@@ -245,6 +250,7 @@ fi
 
 cmake_extra_flags+=" -DCMAKE_INSTALL_PREFIX=$xrt_install_prefix"
 cmake_extra_flags+=" -DSKIP_KMOD=$skip_kmod"
+cmake_extra_flags+=" -DBUILD_VXDNA=$build_vxdna"
 
 if [[ ! -z "$download_dir" ]]; then
   echo "Specified download directory is $download_dir"
