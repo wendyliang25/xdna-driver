@@ -9,15 +9,15 @@ set(VXDNA_VERSION "${VXDNA_VERSION_MAJOR}.${VXDNA_VERSION_MINOR}.${VXDNA_VERSION
 
 # Source files
 set(VXDNA_SOURCES
-    src/vaccel_manager.c
-    src/vaccel_context.c
-    src/vaccel_resource.c
-    src/vaccel_fence.c
-    src/vaccel_drm_backend.c
-    util/hash_table_u32.c
-    util/hash_table_u64.c
-    util/hash_table_ptr.c
+    src/vaccel_manager.cpp
+    src/vaccel_context.cpp
+    src/vaccel_resource.cpp
+    src/vaccel_fence.cpp
+    src/vaccel_drm_backend.cpp
+    src/vaccel_capset.cpp
+    src/vaccel_amdxdna.cpp
     util/os_file.c
+    util/xvdna_debug.c
 )
 
 # Create shared library
