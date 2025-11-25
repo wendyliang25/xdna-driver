@@ -12,7 +12,7 @@
 
 #include "vaccel_internal.h"
 #include "../include/vaccel_renderer.h"
-#include "../util/xvdna_debug.h"
+#include "../util/vxdna_debug.h"
 
 #include <unordered_map>
 #include <cerrno>
@@ -21,143 +21,10 @@
 #include <unistd.h>
 #endif
 
-/* Forward declarations */
-static void vaccel_renderer_cleanup(void);
+#include "vaccel_amdxdna.h"
 
 /* Global device table: cookie -> shared_ptr<vaccel> */
-static std::unordered_map<void*, std::shared_ptr<vaccel>> device_table;
-static mtx_t device_table_lock;
-static bool initialized = false;
-
-// vaccel class constructor
-vaccel::vaccel(void *cookie, uint32_t capset_id, const struct vaccel_callbacks *callbacks)
-    : cookie(cookie)
-    , drm_fd((int)(intptr_t)cookie)
-    , capset_id(capset_id)
-    , callbacks(callbacks)
-    , device_ctx(nullptr)
-    , virtio_gpu_ccmd_process(nullptr)
-    , num_resources(0)
-    , num_contexts(0)
-    , num_fences(0)
-    , num_ccmd_submissions(0)
-{
-    /* Initialize locks */
-    mtx_init(&resource_lock, mtx_plain);
-    mtx_init(&context_lock, mtx_plain);
-    mtx_init(&fence_lock, mtx_plain);
-}
-
-// vaccel class destructor
-vaccel::~vaccel()
-{
-    /* Cleanup device-specific context */
-    if (device_ctx) {
-        switch (capset_id) {
-        case VIRACCEL_CAPSET_ID_AMDXDNA:
-            vxdna_device_cleanup(device_ctx);
-            break;
-        default:
-            xvdna_err("accel cleanup failed, Unsupported capset ID: %u", capset_id);
-            break;
-        }
-        device_ctx = nullptr;
-    }
-
-    /* Cleanup tables */
-    vaccel_fence_table_cleanup(this);
-    vaccel_context_table_cleanup(this);
-    vaccel_resource_table_cleanup(this);
-
-    /* Cleanup locks */
-    mtx_destroy(&fence_lock);
-    mtx_destroy(&context_lock);
-    mtx_destroy(&resource_lock);
-
-    /* Close DRM FD if needed */
-    if (drm_fd >= 0) {
-#ifdef __unix__
-        close(drm_fd);
-#endif
-    }
-}
-
-static int
-vaccel_renderer_init(void)
-{
-    if (initialized)
-        return 0;
-
-    mtx_init(&device_table_lock, mtx_plain);
-    initialized = true;
-
-    return 0;
-}
-
-/**
- * @brief Automatic initialization when library is loaded
- *
- * This constructor function is called automatically when the shared library
- * is loaded into a process. It ensures vaccel_renderer_init() is called
- * without requiring explicit initialization by the user.
- *
- * Platform support:
- * - Linux/Unix: GCC/Clang __attribute__((constructor))
- */
-static void
-vaccel_renderer_auto_init(void)
-{
-    vaccel_renderer_init();
-}
-
-/**
- * @brief Automatic cleanup when library is unloaded
- *
- * This destructor function is called automatically when the shared library
- * is unloaded from a process. It ensures proper cleanup of all resources.
- *
- * Platform support:
- * - Linux/Unix: GCC/Clang __attribute__((destructor))
- */
-static void
-vaccel_renderer_auto_cleanup(void)
-{
-    vaccel_renderer_cleanup();
-}
-
-/* Platform-specific auto-initialization setup */
-#if defined(__GNUC__) || defined(__clang__)
-    /* GCC and Clang */
-    __attribute__((constructor))
-    static void _vaccel_constructor(void) {
-        vaccel_renderer_auto_init();
-    }
-
-    __attribute__((destructor))
-    static void _vaccel_destructor(void) {
-        vaccel_renderer_auto_cleanup();
-    }
-#else
-    #error "Unsupported compiler. This library requires GCC, Clang."
-#endif
-
-static void
-vaccel_renderer_cleanup(void)
-{
-    if (!initialized)
-        return;
-
-    mtx_lock(&device_table_lock);
-    
-    // Map automatically destroys all vaccel objects
-    device_table.clear();
-    
-    mtx_unlock(&device_table_lock);
-
-    mtx_destroy(&device_table_lock);
-    initialized = false;
-}
-
+static vaccel_map<void*, std::shared_ptr<vxdna>> device_table;
 
 /**
  * @brief Add a device to the global device table
@@ -165,30 +32,12 @@ vaccel_renderer_cleanup(void)
  * @param device Shared pointer to device (moved into table)
  * @return 0 on success, negative errno on failure
  */
-static int
-vaccel_add(std::shared_ptr<vaccel>&& device)
+static void
+vaccel_add(std::shared_ptr<vxdna>&& device)
 {
-    if (!initialized)
-        return -EINVAL;
-
-    if (!device)
-        return -EINVAL;
-
-    void *cookie = device->cookie;
-
-    mtx_lock(&device_table_lock);
-    
-    try {
-        // Move shared_ptr into map (transfers ownership)
-        auto result = device_table.try_emplace(cookie, std::move(device));
-        mtx_unlock(&device_table_lock);
-        return result.second ? 0 : -EEXIST;
-    } catch (...) {
-        mtx_unlock(&device_table_lock);
-        return -ENOMEM;
-    }
+    void *cookie = device->get_cookie();
+    device_table.insert(cookie, std::move(device));
 }
-
 
 /**
  * @brief Remove a device from the global device table
@@ -198,17 +47,8 @@ vaccel_add(std::shared_ptr<vaccel>&& device)
 static void
 vaccel_remove(void *cookie)
 {
-    if (!initialized)
-        return;
-
-    mtx_lock(&device_table_lock);
-    
-    // Erasing from map automatically calls destructor
     device_table.erase(cookie);
-    
-    mtx_unlock(&device_table_lock);
 }
-
 
 /**
  * @brief Look up a device by its cookie
@@ -216,84 +56,259 @@ vaccel_remove(void *cookie)
  * @param cookie Device cookie
  * @return Shared pointer to device if found, nullptr otherwise
  */
-std::shared_ptr<vaccel>
+static std::shared_ptr<vxdna>
 vaccel_lookup(void *cookie)
 {
-    if (!initialized)
-        return nullptr;
-
-    mtx_lock(&device_table_lock);
-    
-    auto it = device_table.find(cookie);
-    std::shared_ptr<vaccel> device = (it != device_table.end()) ? it->second : nullptr;
-    
-    mtx_unlock(&device_table_lock);
-
-    return device;
+    return device_table.lookup(cookie);
 }
 
-extern "C" {
-
-int
-vaccel_create(void *cookie, uint32_t capset_id, const struct vaccel_callbacks *callbacks)
+/**
+ * @brief Calculate the total size of an array of iovecs
+ *
+ * @param iovecs Pointer to array of struct iovec
+ * @param num_iovs Number of elements in the iovecs array
+ * @return Total number of bytes in all iovecs
+ */
+static size_t
+_vaccel_get_iovec_size(const struct vaccel_iovec *iovecs, uint32_t num_iovs)
 {
-    int ret;
+    size_t total = 0;
+    if (!iovecs || num_iovs == 0)
+        return 0;
+    for (uint32_t i = 0; i < num_iovs; ++i) {
+        total += iovecs[i].iov_len;
+    }
+    return total;
+}
 
-    if (!initialized) {
-        xvdna_err("Renderer not initialized");
-        return -EINVAL;
+static void
+_vaccel_create_resource_blob(void *cookie, const struct vaccel_create_resource_blob_args *args)
+{
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+
+    auto device = vaccel_lookup(cookie);
+    if (!device)
+        VACCEL_THROW_MSG(-ENODEV, "Device not found for cookie %p", cookie);
+
+    if (args->blob_mem != VACCEL_BLOB_MEM_GUEST)
+        VACCEL_THROW_MSG(-EINVAL, "Unsupported blob memory type: %u", args->blob_mem);
+
+    /* user resource id must be greater than 0 */
+    if (args->res_handle == 0)
+        VACCEL_THROW_MSG(-EINVAL, "Resource handle must be greater than 0");
+    /* user resource id must be unique */
+    if (device->get_resource(args->res_handle))
+        VACCEL_THROW_MSG(-EINVAL, "Resource handle must be unique, %u already exists", args->res_handle);
+
+    if (args->size == 0)
+        VACCEL_THROW_MSG(-EINVAL, "Resource blob size must be greater than 0, size=%zu", args->size);
+    const size_t iov_size = _vaccel_get_iovec_size(args->iovecs, args->num_iovs);
+    if (iov_size < args->size)
+        VACCEL_THROW_MSG(-EINVAL, "IO vector size is less than the blob size");
+
+    device->create_resource(args);
+}
+
+static void
+_vaccel_detach_resource_blob(void *cookie, uint32_t res_handle,
+                             struct vaccel_iovec **iovecs_out, uint32_t *num_iovs_out)
+{
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+
+    // Lookup the device
+    auto device = vaccel_lookup(cookie);
+    if (!device)
+        VACCEL_THROW_MSG(-ENODEV, "Device not found for cookie %p", cookie);
+
+    // Lookup the resource.
+    auto resource = device->get_resource(res_handle);
+    if (!resource)
+        VACCEL_THROW_MSG(-ENOENT, "Resource handle %u not found", res_handle);
+
+    const struct vaccel_iovec *iovecs;
+    auto num_iovs = resource->get_iovecs(&iovecs);
+    *iovecs_out = const_cast<struct vaccel_iovec *>(iovecs);
+    *num_iovs_out = num_iovs;
+}
+
+static void
+_vaccel_destroy_resource_blob(void *cookie, uint32_t res_handle)
+{
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+    auto device = vaccel_lookup(cookie);
+    device->destroy_resource(res_handle);
+}
+
+static void
+_vaccel_submit_fence(void *cookie, uint32_t ctx_id, uint32_t flags,
+                     uint32_t ring_idx, uint64_t fence_id)
+{
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+    auto device = vaccel_lookup(cookie);
+    device->submit_fence(ctx_id, flags, ring_idx, fence_id);
+}
+
+static void
+_vaccel_submit_ccmd(void *cookie, uint32_t ctx_id, const void *ccmd, uint32_t ccmd_size)
+{
+    if (!ccmd_size)
+        VACCEL_THROW_MSG(-EINVAL, "Command buffer size is 0");
+    if (!ccmd)
+        VACCEL_THROW_MSG(-EINVAL, "Command buffer is nullptr");
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+    if (ccmd_size & 3)
+        VACCEL_THROW_MSG(-EINVAL, "Command buffer size is not aligned to 4 bytes");
+    auto device = vaccel_lookup(cookie);
+    if (!device)
+        VACCEL_THROW_MSG(-ENODEV, "Device not found for cookie %p", cookie);
+    auto ctx = device->get_ctx(ctx_id);
+    if (!ctx)
+        VACCEL_THROW_MSG(-ENOENT, "Context not found: ctx_id=%u", ctx_id);
+
+    const uint8_t *buf = static_cast<const uint8_t *>(ccmd);
+    uint32_t alignment = ctx->get_ccmd_align();
+
+    vxdna_dbg("Submitting command buffer: ctx_id=%u, size=%u", ctx->get_id(), ccmd_size);
+
+    while (ccmd_size >= sizeof(struct vdrm_ccmd_req)) {
+        const struct vdrm_ccmd_req *hdr = reinterpret_cast<const struct vdrm_ccmd_req *>(buf);
+
+        /* Sanity check first: */
+        if ((hdr->len > ccmd_size) || (hdr->len < sizeof(*hdr)) || (hdr->len & (alignment - 1)))
+            VACCEL_THROW_MSG(-EINVAL, "bad size, %u vs %u (cmd %u, min alignment %u)",
+                             hdr->len, ccmd_size, hdr->cmd, alignment);
+
+        if (hdr->rsp_off & (alignment - 1))
+            VACCEL_THROW_MSG(-EINVAL, "bad rsp_off, %u, min alignment %u",
+                            hdr->rsp_off, alignment);
+
+        device->dispatch_ccmd(ctx, hdr);
+
+        buf += hdr->len;
+        ccmd_size -= hdr->len;
     }
-    if (capset_id != VIRACCEL_CAPSET_ID_AMDXDNA) {
-        xvdna_err("Unsupported capset ID: %u", capset_id);
-        return -EINVAL;
-    }
+
+    if (ccmd_size > 0)
+        VACCEL_THROW_MSG(-EINVAL, "bad size, %u trailing bytes", ccmd_size);
+}
+
+static void
+_vaccel_get_capset_info(void *cookie, uint32_t *max_version, uint32_t *max_size)
+{
+    vxdna_dbg("Getting capset info for cookie=%p", cookie);
+
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+
+    /* Lookup device by cookie */
+    auto device = vaccel_lookup(cookie);
+    if (!device)
+        VACCEL_THROW_MSG(-ENODEV, "Device not found for cookie %p", cookie);
+
+    /* Validate capset ID */
+    auto capset_id = device->get_capset_id();
+    if (capset_id != VIRACCEL_CAPSET_ID_AMDXDNA)
+        VACCEL_THROW_MSG(-ENOTSUP, "Unsupported capset ID: %u (expected %u)",
+                         capset_id, VIRACCEL_CAPSET_ID_AMDXDNA);
+
+    /* Return max version if requested */
+    device->get_capset_info(max_version, max_size);
+
+    vxdna_info("Capset info retrieved successfully for capset_id=%u", capset_id);
+}
+
+static void
+_vaccel_fill_capset(void *cookie, uint32_t capset_size, void *capset_buf)
+{
+    vxdna_dbg("Filling capset for cookie=%p, capset_size=%u", cookie, capset_size);
+
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+        
+    if (!capset_buf)
+        VACCEL_THROW_MSG(-EINVAL, "Capset buffer is nullptr");
+
+    /* Lookup device by cookie */
+    auto device = vaccel_lookup(cookie);
+    if (!device)
+        VACCEL_THROW_MSG(-ENODEV, "Device not found for cookie %p", cookie);
+
+    device->fill_capset(capset_size, capset_buf);
+}
+
+static void
+_vaccel_create_ctx_with_flags(void *cookie, uint32_t ctx_id, uint32_t ctx_flags,
+                              uint32_t nlen, const char *name)
+{
+    vxdna_dbg("Creating execution ctx: cookie=%p, ctx_id=%u, flags=0x%x, nlen=%u, name=%s",
+              cookie, ctx_id, ctx_flags, nlen, name ? name : "(null)");
+
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+
+    // Lookup device
+    auto device = vaccel_lookup(cookie);
+    if (!device)
+        VACCEL_THROW_MSG(-ENODEV, "Device not found for cookie %p", cookie);
+
+    // Delegate to device method to create context
+    device->create_ctx(ctx_id, ctx_flags, nlen, name);
+
+    vxdna_dbg("Execution context created successfully: ctx_id=%u (device %p)", ctx_id, cookie);
+}
+
+static void
+_vaccel_destroy_ctx(void *cookie, uint32_t ctx_id)
+{
+    vxdna_dbg("Destroying execution ctx: cookie=%p, ctx_id=%u", cookie, ctx_id);
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+    auto device = vaccel_lookup(cookie);
+    device->destroy_ctx(ctx_id);
+}
+
+static void
+_vaccel_device_create(void *cookie, uint32_t capset_id,
+                      const struct vaccel_callbacks *callbacks)
+{
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+
+    if (capset_id != VIRACCEL_CAPSET_ID_AMDXDNA)
+        VACCEL_THROW_MSG(-EINVAL, "Unsupported capset ID: %u", capset_id);
 
     /* Check if device already exists */
-    if (vaccel_lookup(cookie)) {
-        xvdna_err("Device already exists for cookie %p", cookie);
-        return -EEXIST;
-    }
+    if (vaccel_lookup(cookie))
+        VACCEL_THROW_MSG(-EEXIST, "Device already exists for cookie %p", cookie);
+
+    if (!callbacks)
+        VACCEL_THROW_MSG(-EINVAL, "Callbacks are nullptr");
 
     /* Create device as shared_ptr */
-    auto device = std::make_shared<vaccel>(cookie, capset_id, callbacks);
+    auto device = std::make_shared<vxdna>(cookie, capset_id, callbacks);
 
+    if (!callbacks->get_device_fd)
+        VACCEL_THROW_MSG(-EINVAL, "get_device_fd callback is nullptr");
+
+    int drm_fd = callbacks->get_device_fd(cookie);
+    if (drm_fd <= 0)
+        VACCEL_THROW_MSG(drm_fd, "Invalid device file descriptor");
+
+    device->set_drm_fd(drm_fd);
     /* Add to global table (moves shared_ptr into map) */
-    ret = vaccel_add(std::move(device));
-    if (ret) {
-        return ret;
-    }
+    vaccel_add(std::move(device));
 
-    /* Get shared pointer to device in map for initialization */
-    auto device_ptr = vaccel_lookup(cookie);
-    if (!device_ptr) {
-        xvdna_err("Failed to lookup device after creation");
-        return -EINVAL;
-    }
-
-    /* Initialize device-specific context */
-    switch (capset_id) {
-    case VIRACCEL_CAPSET_ID_AMDXDNA:
-        device_ptr->device_ctx = vxdna_device_init(cookie);
-        if (!device_ptr->device_ctx) {
-            xvdna_err("Failed to initialize AMDXDNA device");
-            vaccel_remove(cookie);
-            return -EINVAL;
-        }
-        xvdna_info("AMDXDNA device context initialized");
-        break;
-    default:
-        device_ptr->device_ctx = nullptr;
-        break;
-    }
-
-    xvdna_info("Device created successfully: cookie=%p, capset_id=%u, fd=%d",
-               cookie, capset_id, device_ptr->drm_fd);
-
-    return 0;
+    vxdna_info("Device created successfully: cookie=%p, capset_id=%u",
+               cookie, capset_id);
 }
 
-void
-vaccel_destroy(void *cookie)
+static void
+_vaccel_device_destroy(void *cookie)
 {
     if (!vaccel_lookup(cookie))
         return;
@@ -302,5 +317,109 @@ vaccel_destroy(void *cookie)
     vaccel_remove(cookie);
 }
 
-} // extern "C"
+/**
+ * @defgroup vaccel_device_mgmt External Device Management API
+ * @brief External APIs for vaccel device management.
+ *
+ * This group provides interface functions to query device capability set information,
+ * create a vaccel device instance, and destroy a vaccel device instance.
+ * @{
+ */
 
+int
+vaccel_create_resource_blob(void *cookie, const struct vaccel_create_resource_blob_args *args)
+{
+    return vaccel_error_wrap("vaccel_create_resource_blob", [&]() {
+        _vaccel_create_resource_blob(cookie, args);
+    });
+}
+
+int
+vaccel_detach_resource_blob(void *cookie, uint32_t res_handle,
+                            struct vaccel_iovec **iovecs_out, uint32_t *num_iovs_out)
+{
+    return vaccel_error_wrap("vaccel_detach_resource_blob", [&]() {
+        _vaccel_detach_resource_blob(cookie, res_handle, iovecs_out, num_iovs_out);
+    });
+}
+
+int
+vaccel_destroy_resource_blob(void *cookie, uint32_t res_handle)
+{
+    return vaccel_error_wrap("vaccel_destroy_resource_blob", [&]() {
+        _vaccel_destroy_resource_blob(cookie, res_handle);
+    });
+}
+
+int vaccel_detach_destroy_resource_blob(void *cookie, uint32_t res_handle,
+                                        struct vaccel_iovec **iovecs_out, uint32_t *num_iovs_out)
+{
+    return vaccel_error_wrap("vaccel_detach_destroy_resource_blob", [&]() {
+        _vaccel_detach_resource_blob(cookie, res_handle, iovecs_out, num_iovs_out);
+        _vaccel_destroy_resource_blob(cookie, res_handle);
+    });
+}
+
+int vaccel_submit_fence(void *cookie, uint32_t ctx_id, uint32_t flags,
+                        uint32_t ring_idx, uint64_t fence_id)
+{
+    return vaccel_error_wrap("vaccel_submit_fence", [&]() {
+        _vaccel_submit_fence(cookie, ctx_id, flags, ring_idx, fence_id);
+    });
+}
+
+int vaccel_submit_ccmd(void *cookie, uint32_t ctx_id, const void *ccmd, uint32_t ccmd_size)
+{
+    return vaccel_error_wrap("vaccel_submit_ccmd", [&]() {
+        _vaccel_submit_ccmd(cookie, ctx_id, ccmd, ccmd_size);
+    });
+}
+
+int
+vaccel_get_capset_info(void *cookie,
+                       uint32_t *max_version, uint32_t *max_size)
+{
+    return vaccel_error_wrap("vaccel_get_capset_info", [&]() {
+        return _vaccel_get_capset_info(cookie, max_version, max_size);
+    });
+}
+
+int vaccel_fill_capset(void *cookie, uint32_t capset_size, void *capset_buf)
+{
+    return vaccel_error_wrap("vaccel_fill_capset", [&]() {
+        return _vaccel_fill_capset(cookie, capset_size, capset_buf);
+    });
+}
+
+int vaccel_create_ctx_with_flags(void *cookie, uint32_t ctx_id, uint32_t ctx_flags,
+                                 uint32_t nlen, const char *name)
+{
+    return vaccel_error_wrap("vaccel_create_ctx_with_flags", [&]() {
+        _vaccel_create_ctx_with_flags(cookie, ctx_id, ctx_flags, nlen, name);
+    });
+}
+
+void vaccel_destroy_ctx(void *cookie, uint32_t ctx_id)
+{
+    (void)vaccel_error_wrap("vaccel_destroy_ctx", [&]() {
+        _vaccel_destroy_ctx(cookie, ctx_id);
+    });
+}
+
+int
+vaccel_create(void *cookie, uint32_t capset_id, const struct vaccel_callbacks *callbacks)
+{
+    return vaccel_error_wrap("vaccel_create", [&]() {
+        _vaccel_device_create(cookie, capset_id, callbacks);
+    });
+}
+
+void
+vaccel_destroy(void *cookie)
+{
+    (void)vaccel_error_wrap("vaccel_destroy", [&]() {
+        _vaccel_device_destroy(cookie);
+    });
+}
+
+/** @} */ /* end of vaccel_device_mgmt */

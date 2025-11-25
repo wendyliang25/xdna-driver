@@ -9,8 +9,8 @@
  * @brief OS-specific file descriptor utilities
  */
 
-#ifndef VACCEL_OS_FILE_H
-#define VACCEL_OS_FILE_H
+#ifndef VXDNA_OS_FILE_H
+#define VXDNA_OS_FILE_H
 
 /**
  * @brief Duplicate file descriptor with close-on-exec flag
@@ -29,4 +29,4 @@
  */
 int os_dupfd_cloexec(int fd);
 
-#endif /* VACCEL_OS_FILE_H */
+#endif /* VXDNA_OS_FILE_H */

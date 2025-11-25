@@ -10,24 +10,22 @@ set(VXDNA_VERSION "${VXDNA_VERSION_MAJOR}.${VXDNA_VERSION_MINOR}.${VXDNA_VERSION
 # Source files
 set(VXDNA_SOURCES
     src/vaccel_manager.cpp
-    src/vaccel_context.cpp
-    src/vaccel_resource.cpp
-    src/vaccel_fence.cpp
-    src/vaccel_drm_backend.cpp
-    src/vaccel_capset.cpp
     src/vaccel_amdxdna.cpp
-    util/os_file.c
-    util/xvdna_debug.c
+    util/os_file.cpp
+    util/vxdna_debug.cpp
 )
 
 # Create shared library
 add_library(vxdna SHARED ${VXDNA_SOURCES})
 
-# Set library version
+# Set library version and C++ standard
 set_target_properties(vxdna PROPERTIES
     VERSION ${VXDNA_VERSION}
     SOVERSION ${VXDNA_VERSION_MAJOR}
     OUTPUT_NAME "vxdna"
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
 )
 
 # Include directories
@@ -37,6 +35,8 @@ target_include_directories(vxdna PUBLIC
     PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/util
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include/uapi
+    ${CMAKE_CURRENT_SOURCE_DIR}/../shim/virtio
 )
 
 # Compiler flags
@@ -64,22 +64,3 @@ install(FILES
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     COMPONENT ${XDNA_COMPONENT}
 )
-
-# Optional: Build example program
-option(BUILD_VXDNA_EXAMPLE "Build vxdna example program" OFF)
-
-if(BUILD_VXDNA_EXAMPLE)
-    add_executable(vxdna_example example/example.c)
-    target_link_libraries(vxdna_example PRIVATE vxdna)
-    target_include_directories(vxdna_example PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-    )
-    
-    # Install example (optional)
-    install(TARGETS vxdna_example
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-        COMPONENT ${XDNA_COMPONENT}
-        OPTIONAL
-    )
-endif()
-

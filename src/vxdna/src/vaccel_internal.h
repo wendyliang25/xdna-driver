@@ -15,17 +15,94 @@
 #ifndef VACCEL_INTERNAL_H
 #define VACCEL_INTERNAL_H
 
-#include <stdint.h>
-#include <stddef.h>
-#include <threads.h>
+#include <atomic>
+#include <condition_variable>
+#include <cstring>
+#include <functional>
 #include <unordered_map>
 #include <memory>
+#include <mutex>
+#include <stdint.h>
+#include <stddef.h>
+#include <sys/mman.h>
+#include <thread>
+#ifdef __unix__
+#include <unistd.h>
+#endif
+#include <vector>
 
-/* Forward declarations */
-class vaccel;
-struct vaccel_resource;
-struct vaccel_context;
-struct vaccel_fence;
+#include "vaccel_error.h"
+#include "../include/vaccel_renderer.h"
+
+/**
+ * @brief Thread-safe wrapper around std::unordered_map
+ *
+ * vaccel_map provides synchronized access to an unordered_map using std::mutex.
+ * Supports lookup, insertion (by value, lvalue ref, and rvalue), remove, and clear.
+ */
+template<typename Key, typename Value>
+class vaccel_map {
+public:
+    vaccel_map() = default;
+
+    // Disable copy and move
+    vaccel_map(const vaccel_map&) = delete;
+    vaccel_map& operator=(const vaccel_map&) = delete;
+
+    // Lookup: returns a shared pointer to the value if present, nullptr otherwise
+    Value lookup(const Key& key) const {
+        std::lock_guard<std::mutex> lock(_mtx);
+        auto it = _map.find(key);
+        if (it != _map.end())
+            return it->second;
+        return Value();
+    }
+
+    // Insert by const reference
+    bool insert(const Key& key, const Value& value) {
+        std::lock_guard<std::mutex> lock(_mtx);
+        return _map.emplace(key, value).second;
+    }
+
+    // Insert by rvalue (move value in)
+    bool insert(const Key& key, Value&& value) {
+        std::lock_guard<std::mutex> lock(_mtx);
+        return _map.emplace(key, std::move(value)).second;
+    }
+
+    // Insert with rvalue key and value
+    bool insert(Key&& key, Value&& value) {
+        std::lock_guard<std::mutex> lock(_mtx);
+        return _map.emplace(std::move(key), std::move(value)).second;
+    }
+
+    // Remove element by key
+    bool erase(const Key& key) {
+        std::lock_guard<std::mutex> lock(_mtx);
+        return _map.erase(key) > 0;
+    }
+
+    // Clear all elements
+    void clear() {
+        std::lock_guard<std::mutex> lock(_mtx);
+        _map.clear();
+    }
+
+    // Check if map contains key
+    bool contains(const Key& key) {
+        std::lock_guard<std::mutex> lock(_mtx);
+        return _map.find(key) != _map.end();
+    }
+
+    // Optional: Map size
+    size_t size() const {
+        return _map.size();
+    }
+
+private:
+    std::unordered_map<Key, Value> _map;
+    mutable std::mutex _mtx;
+};
 
 /**
  * @brief GPU resource (buffer object) structure
@@ -33,13 +110,130 @@ struct vaccel_fence;
  * Represents a GPU buffer that can be accessed by rendering commands.
  * Resources can be exported as DMA-BUF file descriptors for sharing.
  */
-struct vaccel_resource {
+class vaccel_resource {
+public:
+    vaccel_resource(uint32_t res_id_in, uint64_t size_in, uint32_t flags_in,
+        const struct vaccel_iovec *iovecs_in, uint32_t num_iovecs_in)
+        : res_id(res_id_in)
+        , size(size_in)
+        , flags(flags_in)
+        , fd(-1)
+        , map_addr(NULL)
+        , iovecs(iovecs_in)
+        , num_iovecs(num_iovecs_in)
+    {}
+
+    ~vaccel_resource()
+    {
+        if (fd >= 0)
+            close(fd);
+        if (map_addr)
+            munmap(map_addr, size);
+    }
+
+    uint32_t
+    get_res_id() const noexcept
+    {
+        return res_id;
+    }
+
+    uint64_t
+    get_size() const noexcept
+    {
+        return size;
+    }
+
+    uint32_t
+    get_flags() const noexcept
+    {
+        return flags;
+    }
+
+    int
+    get_fd() const noexcept
+    {
+        return fd;
+    }
+
+    void *
+    get_map_addr() const noexcept
+    {
+        return map_addr;
+    }
+
+    uint32_t
+    write(uint32_t offset, const void *buf, uint32_t size)
+    {
+        uint32_t bytes_written = 0;
+
+        for (uint32_t i = 0; i < num_iovecs; i++) {
+            if (offset >= iovecs[i].iov_len) {
+                offset -= iovecs[i].iov_len;
+                continue;
+            }
+
+            uint32_t len = size;
+            if (len > iovecs[i].iov_len - offset)
+                 len = iovecs[i].iov_len - offset;
+            void *dst = static_cast<void *>(static_cast<uint8_t *>(iovecs[i].iov_base) + offset);
+            std::memcpy(dst, buf, len);
+
+            buf = static_cast<const void *>(static_cast<const uint8_t *>(buf) + len);
+            size -= len;
+            bytes_written += len;
+            offset = 0;
+        }
+
+        if (size > 0)
+            VACCEL_THROW_MSG(-EINVAL, "buffer to res is too big, %u bytes remaining, %u bytes written",
+                             size, bytes_written);
+
+        return bytes_written;
+    }
+
+    uint32_t
+    read(uint32_t offset, void *buf, uint32_t size)
+    {
+        uint32_t bytes_read = 0;
+        for (uint32_t i = 0; i < num_iovecs; i++) {
+            if (offset >= iovecs[i].iov_len) {
+                offset -= iovecs[i].iov_len;
+                continue;
+            }
+            uint32_t len = size;
+            if (len > iovecs[i].iov_len - offset)
+                 len = iovecs[i].iov_len - offset;
+            void *src = static_cast<void *>(static_cast<uint8_t *>(iovecs[i].iov_base) + offset);
+            std::memcpy(buf, src, len);
+
+            buf = static_cast<void *>(static_cast<uint8_t *>(buf) + len);
+            size -= len;
+            bytes_read += len;
+            offset = 0;
+        }
+
+        if (size > 0)
+            VACCEL_THROW_MSG(-EINVAL, "buffer from res is too big, %u bytes remaining, %u bytes read",
+                             size, bytes_read);
+
+        return bytes_read;
+    }
+
+    uint32_t
+    get_iovecs(const struct vaccel_iovec **iovecs_out) const noexcept
+    {
+        *iovecs_out = iovecs;
+        return num_iovecs;
+    }
+
+private:
     uint32_t res_id;           /**< Resource ID (unique per device) */
     uint64_t size;             /**< Resource size in bytes */
     uint32_t flags;            /**< Resource creation flags */
     int fd;                    /**< DMA-BUF FD or -1 if not exported */
-    uint32_t bo_handle;        /**< libdrm buffer object handle */
     void *map_addr;            /**< Mapped address (NULL if not mapped) */
+    const struct vaccel_iovec *iovecs; /**< IO vectors */
+    uint32_t num_iovecs; /**< Number of IO vectors */
 };
 
 /**
@@ -48,13 +242,38 @@ struct vaccel_resource {
  * Represents an independent command stream for GPU operations.
  * Each context maintains its own command queue and fence timeline.
  */
-struct vaccel_context {
+template <typename ContextType>
+class vaccel_context {
+public:
+    vaccel_context(uint32_t ctx_id_in, int fd_in, uint32_t ccmd_align_in)
+        : ctx_id(ctx_id_in)
+        , fd(fd_in)
+        , ccmd_align(ccmd_align_in)
+    {}
+
+    int
+    get_fd() const noexcept
+    {
+        return fd;
+    }
+
+    uint32_t
+    get_id() const noexcept
+    {
+        return ctx_id;
+    }
+
+    uint32_t
+    get_ccmd_align() const noexcept
+    {
+        return ccmd_align;
+    }
+
+private:
     uint32_t ctx_id;           /**< Context ID (unique per device) */
-    char *name;                /**< Context name (optional, can be NULL) */
-    struct vaccel *device;     /**< Parent device pointer */
-    uint32_t hw_ctx_handle;    /**< Hardware context handle */
-    uint64_t last_fence_id;    /**< Last submitted fence ID */
-    mtx_t lock;                /**< Context lock for thread safety */
+    int fd;                    /**< Context file descriptor */
+    uint32_t ccmd_align;       /**< Command buffer alignment */
+    std::mutex lock;           /**< Context lock for thread safety */
 };
 
 /**
@@ -63,12 +282,61 @@ struct vaccel_context {
  * Represents a synchronization point in the GPU timeline.
  * Fences can be waited on or exported as sync file descriptors.
  */
-struct vaccel_fence {
+class vaccel_fence {
+public:
+    vaccel_fence(uint64_t id_in, uint64_t sync_point_in,
+                 uint32_t syncobj_handle_in, uint32_t ring_idx_in,
+                 int64_t timeout_nsec_in)
+        : id(id_in)
+        , sync_point(sync_point_in)
+        , syncobj_handle(syncobj_handle_in)
+        , ring_idx(ring_idx_in)
+        , timeout_nsec(timeout_nsec_in)
+    {}
+
+    uint64_t
+    get_sync_point() const noexcept
+    {
+        return sync_point;
+    }
+
+    uint32_t
+    get_syncobj_handle() const noexcept
+    {
+        return syncobj_handle;
+    }
+
+    uint32_t
+    get_ring_idx() const noexcept
+    {
+        return ring_idx;
+    }
+
+    uint64_t
+    get_id() const noexcept
+    {
+        return id;
+    }
+
+    int64_t
+    get_timeout_nsec() const noexcept
+    {
+        return timeout_nsec;
+    }
+private:
     uint64_t id;               /**< Fence ID (64-bit timeline value) */
-    int fd;                    /**< Sync file FD or -1 */
+    uint64_t sync_point;       /**< Sync point */
+    uint32_t syncobj_handle;   /**< Syncobj handle */
     uint32_t ring_idx;         /**< Timeline/ring index */
-    struct timespec timestamp; /**< Creation time for hung detection */
+    int64_t timeout_nsec;      /**< Timeout in nanoseconds */
 };
+
+template <typename M>
+void vaccel_map_cleanup(M &map, std::mutex &lock) 
+{
+    std::lock_guard<std::mutex> guard(lock);
+    map.clear();
+}
 
 /**
  * @brief Device instance class
@@ -76,6 +344,7 @@ struct vaccel_fence {
  * Represents a single device instance with its own resource, context,
  * and fence tables. Multiple devices can coexist independently.
  */
+template <typename T, typename ContextType>
 class vaccel {
 public:
     /**
@@ -87,352 +356,186 @@ public:
      * @param capset_id Capability set ID
      * @param callbacks User callbacks
      */
-    vaccel(void *cookie, uint32_t capset_id, const struct vaccel_callbacks *callbacks);
+    vaccel(void *cookie, uint32_t capset_id, const struct vaccel_callbacks *callbacks)
+        : cookie(cookie)
+        , drm_fd(-1)
+        , capset_id(capset_id)
+        , callbacks(callbacks)
+    {}
 
     /**
      * @brief Destructor
      *
      * Cleans up all resources, contexts, and fences.
      */
-    ~vaccel();
+    ~vaccel()
+    {
+        /* Close DRM FD if needed */
+        if (drm_fd >= 0) {
+            close(drm_fd);
+        }
+    }
 
     // Disable copy and move
     vaccel(const vaccel&) = delete;
-    vaccel& operator=(const vaccel&) = delete;
-    vaccel(vaccel&&) = delete;
-    vaccel& operator=(vaccel&&) = delete;
+    vaccel& operator=(const vaccel&) = default;
+    vaccel(vaccel&&) = default;
+    vaccel& operator=(vaccel&&) = default;
 
+    void
+    get_capset_info(uint32_t *max_version, uint32_t *max_size)
+    {
+        static_cast<T*>(this)->get_capset_info(max_version, max_size);
+    }
+
+    void
+    fill_capset(uint32_t capset_size, void *capset_buf) {
+        static_cast<T*>(this)->fill_capset(capset_size, capset_buf);
+    }
+
+    std::shared_ptr<ContextType>
+    get_ctx(uint32_t ctx_id)
+    {
+        return context_table.lookup(ctx_id);
+    }
+
+    void
+    add_ctx(uint32_t ctx_id, std::shared_ptr<ContextType> &&ctx)
+    {
+       context_table.insert(ctx_id, std::move(ctx));
+    }
+
+    void
+    remove_ctx(uint32_t ctx_id)
+    {
+        context_table.erase(ctx_id);
+    }
+
+    void
+    create_ctx(uint32_t ctx_id, uint32_t ctx_flags, uint32_t nlen, const char *name)
+    {
+        auto ctx = get_ctx(ctx_id);
+        if (ctx)
+            VACCEL_THROW_MSG(-EEXIST, "Context already exists: ctx_id=%u", ctx_id);
+        static_cast<T*>(this)->create_ctx(ctx_id, ctx_flags, nlen, name);
+    }
+
+    void
+    destroy_ctx(uint32_t ctx_id)
+    {
+        auto ctx = get_ctx(ctx_id);
+        if (!ctx)
+            VACCEL_THROW_MSG(-ENOENT, "Context not found: ctx_id=%u", ctx_id);
+        static_cast<T*>(this)->destroy_ctx(ctx_id);
+    }
+
+    std::shared_ptr<vaccel_resource>
+    get_resource(uint32_t res_id) const
+    {
+        return resource_table.lookup(res_id);
+    }
+
+    void
+    add_resource(uint32_t res_id, std::shared_ptr<vaccel_resource> &&res)
+    {
+        resource_table.insert(res_id, std::move(res));
+    }
+
+    void
+    create_resource(const struct vaccel_create_resource_blob_args *args)
+    {
+        auto res = std::make_shared<vaccel_resource>(args->res_handle, args->size, args->blob_flags, args->iovecs, args->num_iovs);
+        add_resource(args->res_handle, std::move(res));
+    }
+
+    void
+    destroy_resource(uint32_t res_id)
+    {
+        auto res = get_resource(res_id);
+        if (!res)
+            VACCEL_THROW_MSG(-ENOENT, "Resource not found: res_id=%u", res_id);
+        static_cast<T*>(this)->destroy_resource(res);
+        resource_table.erase(res_id);
+    }
+
+    int
+    get_drm_fd() const noexcept
+    {
+        return callbacks->get_device_fd(get_cookie());
+    }
+
+    void
+    set_drm_fd(int fd) noexcept
+    {
+        drm_fd = fd;
+    }
+
+    uint32_t
+    get_capset_id() const noexcept
+    {
+        return capset_id;
+    }
+
+    void *
+    get_cookie() const noexcept
+    {
+        return cookie;
+    }
+
+    std::shared_ptr<vaccel_fence>
+    get_fence(uint32_t fence_id)
+    {
+        return fence_table.lookup(fence_id);
+    }
+
+    void add_fence(uint32_t fence_id, std::shared_ptr<vaccel_fence> &&fence)
+    {
+        fence_table.insert(fence_id, std::move(fence));
+    }
+
+    void remove_fence(uint32_t fence_id)
+    {
+        fence_table.erase(fence_id);
+    }
+
+    void submit_fence(uint32_t ctx_id, uint32_t flags, uint32_t ring_idx, uint64_t fence_id)
+    {
+        static_cast<T*>(this)->submit_fence(ctx_id, flags, ring_idx, fence_id); 
+    }
+
+    void
+    destroy_fence(uint32_t fence_id)
+    {
+        static_cast<T*>(this)->destroy_fence(fence_id);
+    }
+
+    void
+    dispatch_ccmd(std::shared_ptr<ContextType> &ctx, const struct vdrm_ccmd_req *hdr)
+    {
+        static_cast<T*>(this)->dispatch_ccmd(ctx, hdr);
+    }
+
+    const struct vaccel_callbacks *
+    get_callbacks() const noexcept
+    {
+        return callbacks;
+    }
+
+private:
     // Public members for C API compatibility
     void *cookie;              /**< Device cookie (e.g., DRM FD) */
     int drm_fd;                /**< Actual DRM file descriptor */
     uint32_t capset_id;        /**< Capability set ID */
     const struct vaccel_callbacks *callbacks; /**< User callbacks */
-    void *device_ctx;          /**< Device-specific context (e.g., AMDXDNA context) */
-
-    /**
-     * @brief Process virtio GPU command buffer
-     *
-     * Callback to process command buffer for virtio GPU operations.
-     *
-     * @param ctx Context pointer (device-specific)
-     * @param cmd_buf Readonly command buffer
-     * @param buf_size Size of command buffer in bytes
-     * @return 0 on success, negative errno on failure
-     */
-    int (*virtio_gpu_ccmd_process)(void *ctx, const void *cmd_buf, size_t buf_size);
 
     /** @name Lookup tables
      * C++ std::unordered_map storing shared_ptr for automatic reference counting
      * @{
      */
-    std::unordered_map<uint32_t, std::shared_ptr<vaccel_resource>> resource_table;
-    std::unordered_map<uint32_t, std::shared_ptr<vaccel_context>> context_table;
-    std::unordered_map<uint64_t, std::shared_ptr<vaccel_fence>> fence_table;
+    vaccel_map<uint32_t, std::shared_ptr<vaccel_resource>> resource_table;
+    vaccel_map<uint32_t, std::shared_ptr<ContextType>> context_table;
+    vaccel_map<uint64_t, std::shared_ptr<vaccel_fence>> fence_table;
     /** @} */
-
-    /** @name Thread safety
-     * Mutexes for protecting lookup tables
-     * @{
-     */
-    mtx_t resource_lock;       /**< Resource table lock */
-    mtx_t context_lock;        /**< Context table lock */
-    mtx_t fence_lock;          /**< Fence table lock */
-    /** @} */
-
-    /** @name Statistics
-     * Per-device usage counters
-     * @{
-     */
-    uint64_t num_resources;    /**< Number of active resources */
-    uint64_t num_contexts;     /**< Number of active contexts */
-    uint64_t num_fences;       /**< Number of active fences */
-    uint64_t num_ccmd_submissions; /**< Total command submissions */
-      /** @} */
 };
-
-/**
- * @brief Look up a device by its cookie
- *
- * @param cookie Device cookie
- * @return Shared pointer to device if found, nullptr otherwise
- */
-std::shared_ptr<vaccel> vaccel_lookup(void *cookie);
-
-/**
- * @defgroup resource_table Resource Table Management
- * @brief Per-device resource lookup table
- * @{
- */
-
-/**
- * @brief Initialize resource table for a device
- *
- * @param device Device instance
- * @return 0 on success, negative errno on failure
- */
-int vaccel_resource_table_init(struct vaccel *device);
-
-/**
- * @brief Cleanup resource table and free all resources
- *
- * @param device Device instance
- */
-void vaccel_resource_table_cleanup(struct vaccel *device);
-
-/**
- * @brief Look up a resource by ID
- *
- * @param device Device instance
- * @param res_id Resource ID
- * @return Shared pointer to resource if found, nullptr otherwise
- */
-std::shared_ptr<vaccel_resource> vaccel_resource_lookup(vaccel *device, uint32_t res_id);
-
-/**
- * @brief Add a resource to the table
- *
- * @param device Device instance
- * @param res Resource to add
- * @return 0 on success, negative errno on failure
- */
-int vaccel_resource_add(struct vaccel *device, struct vaccel_resource *res);
-
-/**
- * @brief Remove a resource from the table
- *
- * @param device Device instance
- * @param res_id Resource ID
- */
-void vaccel_resource_remove(struct vaccel *device, uint32_t res_id);
-
-/** @} */ /* end of resource_table */
-
-/**
- * @defgroup context_table Context Table Management
- * @brief Per-device context lookup table
- * @{
- */
-
-/**
- * @brief Initialize context table for a device
- *
- * @param device Device instance
- * @return 0 on success, negative errno on failure
- */
-int vaccel_context_table_init(struct vaccel *device);
-
-/**
- * @brief Cleanup context table and free all contexts
- *
- * @param device Device instance
- */
-void vaccel_context_table_cleanup(struct vaccel *device);
-
-/**
- * @brief Look up a context by ID
- *
- * @param device Device instance
- * @param ctx_id Context ID
- * @return Shared pointer to context if found, nullptr otherwise
- */
-std::shared_ptr<vaccel_context> vaccel_context_lookup(vaccel *device, uint32_t ctx_id);
-
-/**
- * @brief Add a context to the table
- *
- * @param device Device instance
- * @param ctx Context to add
- * @return 0 on success, negative errno on failure
- */
-int vaccel_context_add(struct vaccel *device, struct vaccel_context *ctx);
-
-/**
- * @brief Remove a context from the table
- *
- * @param device Device instance
- * @param ctx_id Context ID
- */
-void vaccel_context_remove(struct vaccel *device, uint32_t ctx_id);
-
-/** @} */ /* end of context_table */
-
-/**
- * @defgroup fence_table Fence Table Management
- * @brief Per-device fence lookup table with 64-bit IDs
- * @{
- */
-
-/**
- * @brief Initialize fence table for a device
- *
- * @param device Device instance
- * @return 0 on success, negative errno on failure
- */
-int vaccel_fence_table_init(struct vaccel *device);
-
-/**
- * @brief Cleanup fence table and free all fences
- *
- * @param device Device instance
- */
-void vaccel_fence_table_cleanup(struct vaccel *device);
-
-/**
- * @brief Look up a fence by ID
- *
- * @param device Device instance
- * @param fence_id Fence ID (64-bit)
- * @return Shared pointer to fence if found, nullptr otherwise
- */
-std::shared_ptr<vaccel_fence> vaccel_fence_lookup(vaccel *device, uint64_t fence_id);
-
-/**
- * @brief Add a fence to the table
- *
- * @param device Device instance
- * @param fence Fence to add
- * @return 0 on success, negative errno on failure
- */
-int vaccel_fence_add(struct vaccel *device, struct vaccel_fence *fence);
-
-/**
- * @brief Remove a fence from the table
- *
- * @param device Device instance
- * @param fence_id Fence ID
- */
-void vaccel_fence_remove(struct vaccel *device, uint64_t fence_id);
-
-/**
- * @brief Retire signaled fences and check specific fence status
- *
- * @param device Device instance
- * @param fence_id Fence ID to check
- * @return 0 if fence is retired, -EBUSY if still pending
- */
-int vaccel_fence_retire(struct vaccel *device, uint64_t fence_id);
-
-/** @} */ /* end of fence_table */
-
-/**
- * @defgroup drm_backend DRM Backend
- * @brief DRM/KMS backend implementation
- * @{
- */
-
-/**
- * @brief Create a DRM resource (buffer object)
- *
- * @param device Device instance
- * @param res_id Resource ID
- * @param size Resource size in bytes
- * @param flags Creation flags
- * @return 0 on success, negative errno on failure
- */
-int vaccel_drm_resource_create(struct vaccel *device, uint32_t res_id,
-                                uint64_t size, uint32_t flags);
-
-/**
- * @brief Export DRM resource as DMA-BUF file descriptor
- *
- * @param device Device instance
- * @param res_id Resource ID
- * @param[out] fd Output file descriptor
- * @return 0 on success, negative errno on failure
- */
-int vaccel_drm_resource_export_fd(struct vaccel *device, uint32_t res_id, int *fd);
-
-/**
- * @brief Destroy a DRM resource
- *
- * @param device Device instance
- * @param res_id Resource ID
- */
-void vaccel_drm_resource_destroy(struct vaccel *device, uint32_t res_id);
-
-/**
- * @brief Create a DRM context
- *
- * @param device Device instance
- * @param ctx_id Context ID
- * @param name Context name (optional)
- * @return 0 on success, negative errno on failure
- */
-int vaccel_drm_context_create(struct vaccel *device, uint32_t ctx_id, const char *name);
-
-/**
- * @brief Destroy a DRM context
- *
- * @param device Device instance
- * @param ctx_id Context ID
- */
-void vaccel_drm_context_destroy(struct vaccel *device, uint32_t ctx_id);
-
-/**
- * @brief Submit command buffer to DRM
- *
- * @param device Device instance
- * @param ctx_id Context ID
- * @param buffer Command buffer
- * @param size Buffer size in bytes
- * @return 0 on success, negative errno on failure
- */
-int vaccel_drm_submit_ccmd(struct vaccel *device, uint32_t ctx_id,
-                            const void *buffer, size_t size);
-
-/**
- * @brief Submit fence to DRM for timeline synchronization
- *
- * @param device Device instance
- * @param ctx_id Context ID
- * @param fence_id Fence ID
- * @param ring_idx Timeline/ring index
- * @return 0 on success, negative errno on failure
- */
-int vaccel_drm_submit_fence(struct vaccel *device, uint32_t ctx_id,
-                             uint64_t fence_id, uint32_t ring_idx);
-
-/** @} */ /* end of drm_backend */
-
-/**
- * @defgroup amdxdna_device AMDXDNA Device
- * @brief AMDXDNA-specific device initialization and management
- * @{
- */
-
-/**
- * @brief Initialize AMDXDNA device
- *
- * @param cookie Device cookie
- * @return Device context pointer on success, NULL on failure
- */
-void *vxdna_device_init(void *cookie);
-
-/**
- * @brief Cleanup AMDXDNA device context
- *
- * @param ctx Device context pointer
- */
-void vxdna_device_cleanup(void *ctx);
-
-/**
- * @brief Get device context from cookie
- *
- * @param cookie Device cookie
- * @return Device context pointer, or NULL if not found
- */
-void *vxdna_device_get_ctx(void *cookie);
-
-/**
- * @brief Process virtio GPU command buffer
- *
- * @param cookie Device cookie
- * @param cmd_buf Readonly command buffer
- * @param buf_size Size of command buffer in bytes
- * @return 0 on success, negative errno on failure
- */
-int vxdna_device_process_ccmd(void *cookie, const void *cmd_buf, size_t buf_size);
-
-/** @} */ /* end of amdxdna_device */
 
 #endif /* VACCEL_INTERNAL_H */
