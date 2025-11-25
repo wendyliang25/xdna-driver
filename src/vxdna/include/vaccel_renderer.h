@@ -23,6 +23,41 @@ extern "C" {
 #endif
 
 /**
+ * @brief Resource blob memory type enumeration
+ *
+ * Specifies the memory location for backing blob resources.
+ * enum values referers to virglrenderer blob memory type
+ */
+enum vaccel_blob_mem_type {
+    VACCEL_BLOB_MEM_GUEST = 0,   /**< Blob memory in guest-allocated memory */
+    VACCEL_BLOB_MEM_MAX = 1,     /**< Maximum supported blob mem type (sentinel) */
+};
+
+/**
+ * @brief IO vector structure
+ *
+ * Represents a contiguous memory region.
+ * Similar to struct iovec in Linux, rename it here to avoid confusion with Linux iovec.
+ * And make it possible to future extension of the struct and avoid breaking changes.
+ */
+struct vaccel_iovec {
+    void *iov_base; // Pointer to the memory region
+    size_t iov_len; // Length of the memory region
+};
+
+struct vaccel_create_resource_blob_args
+{
+    uint32_t res_handle; /**< Resource handle */
+    uint32_t ctx_id; /**< Context ID */
+    uint32_t blob_mem; /**< Blob memory type */
+    uint32_t blob_flags; /**< Blob flags */
+    uint64_t blob_id; /**< Blob ID */
+    uint64_t size; /**< Blob size */
+    const struct vaccel_iovec *iovecs; /**< IO vectors */
+    uint32_t num_iovs; /**< Number of IO vectors */
+};
+
+/**
  * @brief Virtio vaccel capset identifiers enumeration
  */
 enum viraccel_capset_id {
@@ -33,9 +68,10 @@ enum viraccel_capset_id {
 /**
  * @brief Virtio vaccel context type enumeration
  */
-enum viraccel_context_type {
-    VIRACCEL_CONTEXT_AMDXDNA = 0,  /**< AMD XDNA virtio context type */
-    VIRACCEL_CONTEXT_MAX = 1,    /**< Maximum supported context type */
+enum virtaccel_context_type {
+    VIRTACCEL_DRM_CONTEXT_MSM = 1,
+    VIRTACCEL_DRM_CONTEXT_AMDGPU = 2,
+    VIRTACCEL_DRM_CONTEXT_AMDXDNA = 3,
 };
 
 /**
@@ -44,11 +80,15 @@ enum viraccel_context_type {
  * Contains capability set information including version range
  * and context type.
  */
-struct vaccel_drm_capset {
-    uint32_t max_version;    /**< Maximum supported version */
-    uint32_t min_version;    /**< Minimum supported version */
-    uint32_t context_type;   /**< Context type identifier */
-};
+ struct vaccel_drm_capset {
+    uint32_t wire_format_version;
+    /* Underlying drm device version: */
+    uint32_t version_major;
+    uint32_t version_minor;
+    uint32_t version_patchlevel;
+    uint32_t context_type;
+    uint32_t pad;
+ };
 
 /**
  * @brief Callback functions structure
@@ -64,10 +104,29 @@ struct vaccel_callbacks {
      * with a given cookie. This allows flexible cookie-to-FD mapping.
      *
      * @param cookie Device cookie
-     * @param user_data Optional user data pointer (can be NULL)
      * @return Device file descriptor on success, negative errno on failure
      */
-    int (*get_device_fd)(void *cookie, void *user_data);
+    int (*get_device_fd)(void *cookie);
+    /**
+     * @brief Write context fence to device, referring to virglrenderer fence write function
+     *
+     * Per-context fences signal in creation order only within a context.
+     * Two per-context fences in two contexts might signal in any order.
+     *
+     * When a per-context fence is created, a fence cookie can be specified. The
+     * cookie will be passed to write_context_fence callback. This replaces
+     * fence_id that is used in ctx0 fencing.
+     *
+     * write_context_fence is called on each fence unless the fence has
+     * VACCEL_FENCE_FLAG_MERGEABLE set. When the bit is set,
+     * write_context_fence might be skipped.
+     *
+     * @param cookie Device cookie
+     * @param ctx_id Context ID to write the fence to
+     * @param ring_idx Hardware/software ring index to associate the fence with
+     * @param fence_id Fence ID to write
+     */
+    void (*write_context_fence)(void *cookie, uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id);
 };
 
 /**
@@ -97,144 +156,17 @@ int vaccel_create(void *cookie, uint32_t capset_id, const struct vaccel_callback
 void vaccel_destroy(void *cookie);
 
 /**
- * @brief Create a context on a device
- *
- * Creates a rendering context for command submission.
- * Each context represents an independent command stream.
- *
- * @param cookie Device cookie
- * @param ctx_id Context ID (unique per device)
- * @param name Context name (optional, can be NULL)
- * @return 0 on success, negative errno on failure
- * @retval 0 Success
- * @retval -ENODEV Device not found
- * @retval -EEXIST Context with this ID already exists
- * @retval -ENOMEM Out of memory
- */
-int vaccel_context_create(void *cookie, uint32_t ctx_id, const char *name);
-
-/**
- * @brief Destroy a context
- *
- * Destroys a context and releases associated resources.
- *
- * @param cookie Device cookie
- * @param ctx_id Context ID
- */
-void vaccel_context_destroy(void *cookie, uint32_t ctx_id);
-
-/**
- * @brief Create a resource (GPU buffer/blob)
- *
- * Creates a GPU resource (buffer object) of the specified size.
- * Resources can be exported as DMA-BUF file descriptors.
- *
- * @param cookie Device cookie
- * @param res_id Resource ID (unique per device)
- * @param size Resource size in bytes
- * @param flags Resource creation flags (reserved, use 0)
- * @return 0 on success, negative errno on failure
- * @retval 0 Success
- * @retval -ENODEV Device not found
- * @retval -EEXIST Resource with this ID already exists
- * @retval -ENOMEM Out of memory or resource allocation failed
- */
-int vaccel_resource_create(void *cookie, uint32_t res_id, uint64_t size, uint32_t flags);
-
-/**
- * @brief Destroy a resource
- *
- * Destroys a GPU resource and releases associated memory.
- *
- * @param cookie Device cookie
- * @param res_id Resource ID
- */
-void vaccel_resource_destroy(void *cookie, uint32_t res_id);
-
-/**
- * @brief Export resource as DMA-BUF file descriptor
- *
- * Exports a resource as a DMA-BUF FD that can be shared with other
- * processes or imported by other drivers.
- *
- * @param cookie Device cookie
- * @param res_id Resource ID
- * @param[out] fd Output file descriptor (caller must close)
- * @return 0 on success, negative errno on failure
- * @retval 0 Success
- * @retval -ENODEV Device not found
- * @retval -ENOENT Resource not found
- * @retval -EINVAL Resource not exportable
- */
-int vaccel_resource_export_fd(void *cookie, uint32_t res_id, int *fd);
-
-/**
- * @brief Submit command buffer (CCMD)
- *
- * Submits a command buffer for execution on the GPU.
- * Commands are executed asynchronously in the specified context.
- *
- * @param cookie Device cookie
- * @param ctx_id Context ID
- * @param buffer Command buffer data
- * @param size Command buffer size in bytes
- * @return 0 on success, negative errno on failure
- * @retval 0 Success
- * @retval -ENODEV Device not found
- * @retval -ENOENT Context not found
- */
-int vaccel_submit_ccmd(void *cookie, uint32_t ctx_id, const void *buffer, size_t size);
-
-/**
- * @brief Submit fence for timeline synchronization
- *
- * Creates a fence point for GPU timeline synchronization.
- * Fences can be waited on or exported as sync file descriptors.
- *
- * @param cookie Device cookie
- * @param ctx_id Context ID
- * @param fence_id Fence ID (64-bit timeline value)
- * @param ring_idx Ring/timeline index (use 0 for default)
- * @return 0 on success, negative errno on failure
- * @retval 0 Success
- * @retval -ENODEV Device not found
- * @retval -ENOENT Context not found
- * @retval -EEXIST Fence with this ID already exists
- * @retval -ENOMEM Out of memory
- */
-int vaccel_submit_fence(void *cookie, uint32_t ctx_id, uint64_t fence_id, uint32_t ring_idx);
-
-/**
- * @brief Get sync file descriptor for a fence
- *
- * Returns a sync file descriptor for the specified fence.
- * The FD can be used with poll() or passed to other drivers.
- *
- * @param cookie Device cookie
- * @param fence_id Fence ID
- * @return Fence FD on success, -1 on failure
- * @note Caller must close the returned file descriptor
- */
-int vaccel_get_fence_fd(void *cookie, uint64_t fence_id);
-
-/**
  * @brief Get virtio vaccel capset information
  *
  * Retrieves capability set information for the specified capset ID.
  * This includes the maximum supported version and maximum size of the capset.
  *
  * @param cookie Device cookie
- * @param capset_id Capability set ID
  * @param[out] max_version Maximum supported capset version (can be NULL)
  * @param[out] max_size Maximum capset size in bytes (can be NULL)
  * @return 0 on success, negative errno on failure
- * @retval 0 Success
- * @retval -EINVAL Invalid arguments or renderer not initialized
- * @retval -ENODEV Device not found
- * @retval -ENOTSUP Operation not supported
  */
-int vaccel_get_capset_info(void *cookie, uint32_t capset_id,
-                            uint32_t *max_version, uint32_t *max_size);
+int vaccel_get_capset_info(void *cookie, uint32_t *max_version, uint32_t *max_size);
 
 /**
  * @brief Fill capset structure with capability set data
@@ -243,18 +175,129 @@ int vaccel_get_capset_info(void *cookie, uint32_t capset_id,
  * The buffer must be large enough to hold the complete capset data.
  *
  * @param cookie Device cookie
- * @param capset_id Capability set ID
- * @param capset_version Requested capset version (currently unused)
  * @param capset_size Size of the provided buffer in bytes
  * @param[out] capset_buf Buffer to receive capset data
  * @return 0 on success, negative errno on failure
- * @retval 0 Success - capset data copied to buffer
- * @retval -EINVAL Invalid arguments (NULL buffer or buffer too small)
- * @retval -ENODEV Device not found
- * @retval -ENOTSUP Unsupported capset ID
  */
-int vaccel_fill_capset(void *cookie, uint32_t capset_id, uint32_t capset_version,
-                        uint32_t capset_size, void *capset_buf);
+int vaccel_fill_capset(void *cookie, uint32_t capset_size, void *capset_buf);
+
+/**
+ * @brief Create a new execution ctx
+ *
+ * Creates a new ctx associated with the given device cookie, with specified
+ * ctx ID, flags, and optional debug name for tracing or debugging purposes.
+ *
+ * @param cookie Device cookie
+ * @param ctx_id 32-bit ctx identifier (unique per ctx)
+ * @param ctx_flags 32-bit flags (behavioral/ctx creation options)
+ * @param nlen Optional, length of debug name in bytes (can be 0 if not provided)
+ * @param name Optional, pointer to C-style string used as a debug name (can be NULL)
+ * @return 0 on success, negative errno on failure
+ */
+int vaccel_create_ctx_with_flags(void *cookie, uint32_t ctx_id, uint32_t ctx_flags,
+                                 uint32_t nlen, const char *name);
+
+/**
+ * @brief Destroy a context
+ *
+ * Destroys a context and all associated resources, fences, and other resources.
+ *
+ * @param cookie Device cookie
+ * @param ctx_id Context ID to destroy
+ */
+void vaccel_destroy_ctx(void *cookie, uint32_t ctx_id);
+
+/**
+ * @brief Create a resource blob
+ *
+ * Allocates a new resource (buffer object/blob) associated with the given device.
+ * The resource is uniquely identified by a resource handle, and must be created
+ * with a valid handle and size. The contents and location are specified by IOVs,
+ * which must collectively be at least as large as the requested blob size.
+ *
+ * @param cookie Device cookie
+ * @param args Pointer to vaccel_create_resource_blob_args structure describing
+ *             the resource to be created. Must include handle, size, flags,
+ *             and IO vector array.
+ * @return 0 on success, negative errno on failure
+ */
+int vaccel_create_resource_blob(void *cookie, const struct vaccel_create_resource_blob_args *args);
+
+/**
+ * @brief Detach a resource from the device and return its IO vector table
+ *
+ * Removes the resource associated with the specified resource handle from the device,
+ * and provides the caller with the base pointer to the resource's IO vector table,
+ * along with the number of IO vectors.
+ *
+ * The caller must manage/lifetime of the returned IO vector table as appropriate.
+ * On success, *iovecs_out will point to the resource's IO vector array and
+ * *num_iovs_out will contain its count.
+ *
+ * @param cookie Device cookie
+ * @param res_handle Resource handle to detach
+ * @param[out] iovecs_out Pointer to receive IO vector array base pointer
+ * @param[out] num_iovs_out Pointer to receive number of IO vectors
+ * @return 0 on success, negative errno on failure
+ */
+int vaccel_detach_resource_blob(void *cookie, uint32_t res_handle,
+                                struct vaccel_iovec **iovecs_out, uint32_t *num_iovs_out);
+
+/**
+ * @brief Destroy a resource blob
+ *
+ * Frees the resource associated with the specified resource handle,
+ * and releases the associated IO vector table.
+ *
+ * @param cookie Device cookie
+ * @param res_handle Resource handle to destroy
+ * @return 0 on success, negative errno on failure
+ */
+int vaccel_destroy_resource_blob(void *cookie, uint32_t res_handle);
+
+/**
+ * @brief Detach and destroy a resource blob
+ *
+ * Removes the resource associated with the specified resource handle from the device,
+ * and provides the caller with the base pointer to the resource's IO vector table,
+ * along with the number of IO vectors.
+ *
+ * @param cookie Device cookie
+ * @param res_handle Resource handle to detach and destroy
+ * @param[out] iovecs_out Pointer to receive IO vector array base pointer
+ * @param[out] num_iovs_out Pointer to receive number of IO vectors
+ * @return 0 on success, negative errno on failure
+ */
+int vaccel_detach_destroy_resource_blob(void *cookie, uint32_t res_handle,
+                                        struct vaccel_iovec **iovecs_out, uint32_t *num_iovs_out);
+
+/**
+ * @brief submit a fence for GPU command synchronization
+ *
+ * Creates a fence object associated with the specified context on the device.
+ *
+ * @param cookie Device cookie
+ * @param ctx_id Context ID on which to create the fence
+ * @param flags Fence creation flags (implementation-specific)
+ * @param ring_idx Hardware/software ring index to associate the fence with
+ * @param fence_id Pointer to receive the created fence ID
+ * @return 0 on success, negative errno on failure
+ */
+ int vaccel_submit_fence(void *cookie, uint32_t ctx_id, uint32_t flags,
+                         uint32_t ring_idx, uint64_t fence_id);
+
+/**
+ * @brief Submit a virtio GPU context command (ccmd)
+ *
+ * Submits a GPU context command buffer to the device associated with the provided cookie and context ID.
+ *
+ * @param cookie Device cookie
+ * @param ctx_id Context ID to submit the command to
+ * @param ccmd Pointer to the command buffer
+ * @param ccmd_size Size of the command buffer, in bytes
+ * @return 0 on success, negative errno on failure
+ */
+int vaccel_submit_ccmd(void *cookie, uint32_t ctx_id, const void *ccmd, uint32_t ccmd_size);
 
 #ifdef __cplusplus
 }
