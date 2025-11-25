@@ -23,6 +23,7 @@ Options:
   -dir                    Download directory if apply
   -nokmod                 Don't build or install the kernel module
   -vxdna                  Build vxdna renderer library
+  -test                   Build and run vxdna unit tests (requires -vxdna)
 USAGE_END
 }
 
@@ -127,6 +128,56 @@ download_vtd_archives()
     done
 }
 
+run_vxdna_tests()
+{
+  BUILD_TYPE=$1
+  
+  if [[ $build_vxdna == 0 ]]; then
+    echo "WARNING: -test requires -vxdna flag. Skipping tests."
+    return
+  fi
+  
+  if [ ! -d $BUILD_TYPE ]; then
+    echo "Build directory $BUILD_TYPE not found. Skipping tests."
+    return
+  fi
+  
+  echo ""
+  echo "========================================"
+  echo "Running vxdna unit tests ($BUILD_TYPE)"
+  echo "========================================"
+  echo ""
+  
+  TEST_BINARY="$BUILD_TYPE/src/vxdna/tests/vaccel_renderer_tests"
+  
+  if [ ! -f "$TEST_BINARY" ]; then
+    echo "WARNING: Test binary not found at $TEST_BINARY"
+    echo "Make sure BUILD_TESTING was enabled during CMake configuration"
+    return 1
+  fi
+  
+  # Run tests
+  cd $BUILD_TYPE/src/vxdna/tests
+  if ./vaccel_renderer_tests; then
+    echo ""
+    echo "========================================"
+    echo "vxdna unit tests PASSED"
+    echo "========================================"
+    echo ""
+    cd $BUILD_DIR
+    return 0
+  else
+    RESULT=$?
+    echo ""
+    echo "========================================"
+    echo "vxdna unit tests FAILED"
+    echo "========================================"
+    echo ""
+    cd $BUILD_DIR
+    return $RESULT
+  fi
+}
+
 do_build()
 {
   BUILD_TYPE=$1
@@ -143,6 +194,11 @@ do_build()
     cp -r ../tools/bins/* $XBUTIL_VALIDATE_BINS_DIR
     package_targets $BUILD_TYPE
   fi
+  
+  # Run tests if requested
+  if [[ $run_tests == 1 ]]; then
+    run_vxdna_tests $BUILD_TYPE
+  fi
 }
 
 # Config variables
@@ -155,6 +211,7 @@ nocmake=0
 verbose=
 skip_kmod=0
 build_vxdna=0
+run_tests=0
 njobs=`grep -c ^processor /proc/cpuinfo`
 download_dir=
 xrt_install_prefix="/opt/xilinx/xrt"
@@ -207,6 +264,9 @@ while [ $# -gt 0 ]; do
     -vxdna)
       build_vxdna=1
       ;;
+    -test)
+      run_tests=1
+      ;;
     -dir)
       download_dir=$2
       shift
@@ -251,6 +311,11 @@ fi
 cmake_extra_flags+=" -DCMAKE_INSTALL_PREFIX=$xrt_install_prefix"
 cmake_extra_flags+=" -DSKIP_KMOD=$skip_kmod"
 cmake_extra_flags+=" -DBUILD_VXDNA=$build_vxdna"
+
+# Enable testing if -test flag is provided
+if [[ $run_tests == 1 ]]; then
+  cmake_extra_flags+=" -DBUILD_TESTING=ON"
+fi
 
 if [[ ! -z "$download_dir" ]]; then
   echo "Specified download directory is $download_dir"

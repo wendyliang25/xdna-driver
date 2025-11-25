@@ -64,3 +64,9 @@ install(FILES
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     COMPONENT ${XDNA_COMPONENT}
 )
+
+# Enable testing
+if(BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
