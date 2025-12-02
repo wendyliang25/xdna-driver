@@ -14,7 +14,6 @@
 #include "../include/vaccel_renderer.h"
 #include "../util/vxdna_debug.h"
 
-#include <bits/types/cookie_io_functions_t.h>
 #include <unordered_map>
 #include <cerrno>
 
@@ -144,13 +143,13 @@ _vaccel_destroy_resource_blob(void *cookie, uint32_t res_handle)
 }
 
 static void
-_vaccel_create_fence(void *cookie, uint32_t ctx_id, uint32_t flags,
-                     uint32_t ring_idx, uint32_t *fence_id)
+_vaccel_submit_fence(void *cookie, uint32_t ctx_id, uint32_t flags,
+                     uint32_t ring_idx, uint64_t fence_id)
 {
     if (!cookie)
         VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
     auto device = vaccel_lookup(cookie);
-    device->create_fence(ctx_id, flags, ring_idx, fence_id);
+    device->submit_fence(ctx_id, flags, ring_idx, fence_id);
 }
 
 static void
@@ -197,17 +196,6 @@ _vaccel_submit_ccmd(void *cookie, uint32_t ctx_id, const void *ccmd, uint32_t cc
     if (ccmd_size > 0)
         VACCEL_THROW_MSG(-EINVAL, "bad size, %u trailing bytes", ccmd_size);
 }
-
-#if 0
-static void
-_vaccel_destroy_fence(void *cookie, uint32_t fence_id)
-{
-    if (!cookie)
-        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
-    auto device = vaccel_lookup(cookie);
-    device->destroy_fence(fence_id);
-}
-#endif
 
 static void
 _vaccel_get_capset_info(void *cookie, uint32_t *max_version, uint32_t *max_size)
@@ -372,11 +360,11 @@ int vaccel_detach_destroy_resource_blob(void *cookie, uint32_t res_handle,
     });
 }
 
-int vaccel_create_fence(void *cookie, uint32_t ctx_id, uint32_t flags,
-                        uint32_t ring_idx, uint32_t *fence_id)
+int vaccel_submit_fence(void *cookie, uint32_t ctx_id, uint32_t flags,
+                        uint32_t ring_idx, uint64_t fence_id)
 {
-    return vaccel_error_wrap("vaccel_create_fence", [&]() {
-        _vaccel_create_fence(cookie, ctx_id, flags, ring_idx, fence_id);
+    return vaccel_error_wrap("vaccel_submit_fence", [&]() {
+        _vaccel_submit_fence(cookie, ctx_id, flags, ring_idx, fence_id);
     });
 }
 

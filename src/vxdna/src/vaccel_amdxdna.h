@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <stddef.h>
+#include <stdexcept>
 #include <memory>
 
 #include "drm_hw.h" // from xdna shim virtio
@@ -85,31 +86,62 @@ public:
     void remove_bo(uint32_t handle);
     void write_err_rsp(int err);
     void write_rsp(const void *rsp, size_t rsp_size, uint32_t rsp_off);
-    void create_hwctx(const struct amdxdna_ccmd_create_ctx_req *req);
+    void create_hwctx(const vxdna &device, const struct amdxdna_ccmd_create_ctx_req *req);
     void remove_hwctx(uint32_t handle);
+    void config_hwctx(const struct amdxdna_ccmd_config_ctx_req *req);
+    void exec_cmd(const struct amdxdna_ccmd_exec_cmd_req *req);
+    void wait_cmd(const struct amdxdna_ccmd_wait_cmd_req *req);
+    void get_info(const vxdna &device, const struct amdxdna_ccmd_get_info_req *req);
+    void read_sysfs(const struct amdxdna_ccmd_read_sysfs_req *req);
+    void submit_fence(uint32_t ring_idx, uint64_t fence_id);
 private:
     class vxdna_hwctx {
     public:
-        vxdna_hwctx(const vxdna_hwctx&) = default;
-        vxdna_hwctx& operator=(const vxdna_hwctx&) = default;
-        vxdna_hwctx(vxdna_hwctx&&) = default;
-        vxdna_hwctx& operator=(vxdna_hwctx&&) = default;
-        vxdna_hwctx() = default;
-        ~vxdna_hwctx() {
-            finish();
-        }
-        int
-        init(const vxdna_context &ctx, const struct amdxdna_ccmd_create_ctx_req *args) noexcept;
+        vxdna_hwctx() = delete;
+        vxdna_hwctx(const vxdna_hwctx&) = delete;
+        vxdna_hwctx& operator=(const vxdna_hwctx&) = delete;
+        vxdna_hwctx(vxdna_hwctx&&) = delete;
+        vxdna_hwctx& operator=(vxdna_hwctx&&) = delete;
+        vxdna_hwctx(const vxdna &device, const vxdna_context &ctx,
+                    const struct amdxdna_ccmd_create_ctx_req *req);
+        ~vxdna_hwctx();
         void
-        finish() noexcept;
+        config(const struct amdxdna_ccmd_config_ctx_req *req);
+        uint64_t
+        exec_cmd(const struct amdxdna_ccmd_exec_cmd_req *req);
+        void set_sync_point(uint64_t sync_point_in) noexcept
+        {
+            std::lock_guard<std::mutex> lock(fences_lock);
+            sync_point = sync_point_in;
+            has_sync_point = true;
+        }
+        uint32_t get_handle() const noexcept
+        {
+            return hwctx_handle;
+        }
+        void submit_fence(uint64_t fence_id);
     private:
-        uint32_t hwctx_handle;
+        void clear_pending();
+        void poll_fences();
+        void poll_and_retire_pending(std::vector<std::shared_ptr<vaccel_fence>> &&copy_pending_fences);
+        void *cookie;
+        void (*write_fence_callback)(void *cookie, uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id) = nullptr;
+        mutable std::mutex fences_lock;
+        uint64_t sync_point;
+        int64_t timeout_nsec;
+        bool has_sync_point;
+        std::condition_variable cv;
+        std::vector<std::shared_ptr<vaccel_fence>> pending_fences;
+        std::thread polling_thread;
+        std::atomic<bool> stop_polling;
+        uint32_t hwctx_handle; // it is also ring_idx
         uint32_t syncobj_handle;
         uint32_t ctx_fd;
+        uint32_t ctx_id;
     };
     std::shared_ptr<vaccel_resource> resp_res;
     vaccel_map<uint32_t, std::shared_ptr<vxdna_bo>> bo_table;
-    vaccel_array<vxdna_hwctx, AMDXDNA_MAX_RING_NUM> hwctx_table;
+    vaccel_map<uint32_t, std::shared_ptr<vxdna_hwctx>> hwctx_table;
 };
 
 /**
@@ -120,7 +152,6 @@ private:
 class vxdna : public vaccel<vxdna, vxdna_context>
 {
 public:
-    
     vxdna(void *cookie, uint32_t capset_id, const struct vaccel_callbacks *callbacks)
         : vaccel<vxdna, vxdna_context>(cookie, capset_id, callbacks)
     {}
@@ -132,14 +163,15 @@ public:
 
     // Example device-specific methods can be added here
 
+    using vaccel<vxdna, vxdna_context>::destroy_resource;
     // Implement required interface for vaccel<T>
     void get_capset_info(uint32_t *max_version, uint32_t *max_size);
     void fill_capset(uint32_t capset_size, void *capset_buf);
     void create_ctx(uint32_t ctx_id, uint32_t ctx_flags, uint32_t nlen, const char *name);
     void destroy_ctx(uint32_t ctx_id);
+    void destroy_resource(const std::shared_ptr<vaccel_resource> &res);
     void context_submit_ccmd(const std::shared_ptr<vxdna_context> &ctx, const void *ccmd, uint32_t ccmd_size);
-    void create_fence(uint32_t ctx_id, uint32_t flags, uint32_t ring_idx, uint32_t *fence_id);
-    void destroy_fence(uint32_t fence_id);
+    void submit_fence(uint32_t ctx_id, uint32_t flags, uint32_t ring_idx, uint64_t fence_id);
     void dispatch_ccmd(std::shared_ptr<vxdna_context> &ctx, const struct vdrm_ccmd_req *hdr);
 private:
     inline static constexpr struct vaccel_drm_capset capset = {
@@ -194,10 +226,13 @@ vxdna_ccmd_error_wrap(const std::shared_ptr<ContextType> &ctx, F &&f)
         f();
     } catch (const vaccel_error& e) {
         ctx->write_err_rsp(e.code());
+        throw e;
     } catch (const std::exception& e) {
         ctx->write_err_rsp(-EIO);
+        throw e;
     } catch (...) {
         ctx->write_err_rsp(-EIO);
+        throw std::runtime_error("Unknown exception");
     }
 }
 

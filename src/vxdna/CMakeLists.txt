@@ -11,7 +11,7 @@ set(VXDNA_VERSION "${VXDNA_VERSION_MAJOR}.${VXDNA_VERSION_MINOR}.${VXDNA_VERSION
 set(VXDNA_SOURCES
     src/vaccel_manager.cpp
     src/vaccel_amdxdna.cpp
-    util/os_file.c
+    util/os_file.cpp
     util/vxdna_debug.cpp
 )
 

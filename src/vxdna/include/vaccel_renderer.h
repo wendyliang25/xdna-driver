@@ -121,7 +121,7 @@ struct vaccel_callbacks {
      * @param ring_idx Hardware/software ring index to associate the fence with
      * @param fence_id Fence ID to write
      */
-    void (*write_context_fence)(void *cookie, uint32_t ctx_id, uint32_t ring_idx, uint32_t fence_id);
+    void (*write_context_fence)(void *cookie, uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id);
 };
 
 /**
@@ -193,6 +193,16 @@ int vaccel_create_ctx_with_flags(void *cookie, uint32_t ctx_id, uint32_t ctx_fla
                                  uint32_t nlen, const char *name);
 
 /**
+ * @brief Destroy a context
+ *
+ * Destroys a context and all associated resources, fences, and other resources.
+ *
+ * @param cookie Device cookie
+ * @param ctx_id Context ID to destroy
+ */
+void vaccel_destroy_ctx(void *cookie, uint32_t ctx_id);
+
+/**
  * @brief Create a resource blob
  *
  * Allocates a new resource (buffer object/blob) associated with the given device.
@@ -226,7 +236,7 @@ int vaccel_create_resource_blob(void *cookie, const struct vaccel_create_resourc
  * @return 0 on success, negative errno on failure
  */
 int vaccel_detach_resource_blob(void *cookie, uint32_t res_handle,
-                                struct iovec **iovecs_out, uint32_t *num_iovs_out);
+                                struct vaccel_iovec **iovecs_out, uint32_t *num_iovs_out);
 
 /**
  * @brief Destroy a resource blob
@@ -254,10 +264,10 @@ int vaccel_destroy_resource_blob(void *cookie, uint32_t res_handle);
  * @return 0 on success, negative errno on failure
  */
 int vaccel_detach_destroy_resource_blob(void *cookie, uint32_t res_handle,
-                                        struct iovec **iovecs_out, uint32_t *num_iovs_out);
+                                        struct vaccel_iovec **iovecs_out, uint32_t *num_iovs_out);
 
 /**
- * @brief Create a fence for GPU command synchronization
+ * @brief submit a fence for GPU command synchronization
  *
  * Creates a fence object associated with the specified context on the device.
  *
@@ -265,11 +275,11 @@ int vaccel_detach_destroy_resource_blob(void *cookie, uint32_t res_handle,
  * @param ctx_id Context ID on which to create the fence
  * @param flags Fence creation flags (implementation-specific)
  * @param ring_idx Hardware/software ring index to associate the fence with
- * @param[out] fence_id Pointer to receive the created fence ID
+ * @param fence_id Pointer to receive the created fence ID
  * @return 0 on success, negative errno on failure
  */
-int vaccel_create_fence(void *cookie, uint32_t ctx_id, uint32_t flags,
-                        uint32_t ring_idx, uint32_t *fence_id);
+ int vaccel_submit_fence(void *cookie, uint32_t ctx_id, uint32_t flags,
+                         uint32_t ring_idx, uint64_t fence_id);
 
 /**
  * @brief Submit a virtio GPU context command (ccmd)

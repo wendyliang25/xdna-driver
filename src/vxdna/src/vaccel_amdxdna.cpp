@@ -5,16 +5,21 @@
  */
 
 /*
- * AMDXDNA Device Initialization
- * Handles device-specific initialization for AMDXDNA capset
+ * AMDXDNA Device Management
+ * Provides device initialization, buffer object management, context handling,
+ * command execution, and command dispatching for the AMDXDNA capset.
  */
 
- #include <algorithm>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <errno.h>
 #include <vector>
 #include <type_traits>
@@ -31,7 +36,8 @@
 #include "vaccel_amdxdna.h"
 #include "../util/vxdna_debug.h"
 
-vxdna_bo::vxdna_bo(int ctx_fd_in, const struct amdxdna_ccmd_create_bo_req *req)
+vxdna_bo::
+vxdna_bo(int ctx_fd_in, const struct amdxdna_ccmd_create_bo_req *req)
 {
     struct amdxdna_drm_get_bo_info bo_info = {};
     struct amdxdna_drm_create_bo args = {};
@@ -41,6 +47,9 @@ vxdna_bo::vxdna_bo(int ctx_fd_in, const struct amdxdna_ccmd_create_bo_req *req)
     bo_type = req->bo_type;
     size = req->size;
     map_size = 0;
+    map_offset = 0;
+    vaddr = AMDXDNA_INVALID_ADDR;
+    xdna_addr = AMDXDNA_INVALID_ADDR;
     args.size = size;
     args.type = bo_type;
     ret = ioctl(ctx_fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &args);
@@ -51,15 +60,16 @@ vxdna_bo::vxdna_bo(int ctx_fd_in, const struct amdxdna_ccmd_create_bo_req *req)
     bo_info.handle = bo_handle;
     ret = ioctl(ctx_fd, DRM_IOCTL_AMDXDNA_GET_BO_INFO, &bo_info);
     if (ret)
-        VACCEL_THROW_MSG(-errno, "Get bo info faild ret %d", ret);
+        VACCEL_THROW_MSG(-errno, "Get bo info failed ret %d", ret);
 
     map_offset = bo_info.map_offset;
     xdna_addr = bo_info.xdna_addr;
     vaddr = bo_info.vaddr;
 }
 
-vxdna_bo::vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
-                   const struct amdxdna_ccmd_create_bo_req *req)
+vxdna_bo::
+vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
+         const struct amdxdna_ccmd_create_bo_req *req)
 {
     struct amdxdna_drm_get_bo_info bo_info = {};
     struct amdxdna_drm_create_bo args = {};
@@ -71,9 +81,11 @@ vxdna_bo::vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
     map_size = 0;
     const struct vaccel_iovec *iovecs;
     auto num_iovs = res->get_iovecs(&iovecs);
-    alignas(amdxdna_drm_va_tbl)
-    char buf[sizeof(amdxdna_drm_va_tbl) + sizeof(amdxdna_drm_va_entry) * num_iovs];
-    auto tbl = reinterpret_cast<amdxdna_drm_va_tbl*>(buf);
+    
+    // Use vector to avoid VLA and potential stack overflow
+    size_t buf_size = sizeof(amdxdna_drm_va_tbl) + sizeof(amdxdna_drm_va_entry) * num_iovs;
+    std::vector<uint8_t> buf_vec(buf_size);
+    auto tbl = reinterpret_cast<amdxdna_drm_va_tbl*>(buf_vec.data());
     tbl->udma_fd = -1;
     tbl->num_entries = num_iovs;
     for (uint32_t i = 0; i < num_iovs; i++) {
@@ -81,7 +93,7 @@ vxdna_bo::vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
         tbl->va_entries[i].len = static_cast<uint64_t>(iovecs[i].iov_len);
         map_size += tbl->va_entries[i].len;
     }
-    args.vaddr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buf));
+    args.vaddr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buf_vec.data()));
     args.size = size;
     args.type = bo_type;
     ret = ioctl(ctx_fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &args);
@@ -92,7 +104,7 @@ vxdna_bo::vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
     bo_info.handle = bo_handle;
     ret = ioctl(ctx_fd, DRM_IOCTL_AMDXDNA_GET_BO_INFO, &bo_info);
     if (ret)
-        VACCEL_THROW_MSG(-errno, "Get bo info faild ret %d", ret);
+        VACCEL_THROW_MSG(-errno, "Get bo info failed ret %d", ret);
 
     map_offset = bo_info.map_offset;
     xdna_addr = bo_info.xdna_addr;
@@ -116,8 +128,11 @@ vxdna_bo::vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
 
     void *va = ::mmap(reinterpret_cast<void *>(va_to_map), map_size, PROT_READ | PROT_WRITE,
                            flags, ctx_fd, map_offset);
-    if (va == MAP_FAILED)
+    if (va == MAP_FAILED) {
+        if (resv_va && resv_va != MAP_FAILED)
+            munmap(resv_va, resv_size);
         VACCEL_THROW_MSG(-EFAULT, "Map bo failed");
+    }
 
     vaddr = reinterpret_cast<uint64_t>(va);
     if (vaddr > resv_vaddr)
@@ -129,7 +144,8 @@ vxdna_bo::vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
     }
 }
 
-vxdna_bo::~vxdna_bo()
+vxdna_bo::
+~vxdna_bo()
 {
     if (vaddr != AMDXDNA_INVALID_ADDR)
         munmap(reinterpret_cast<void *>(vaddr), static_cast<size_t>(map_size));
@@ -142,14 +158,37 @@ vxdna_bo::~vxdna_bo()
     }
 }
 
-int
-vxdna_context::vxdna_hwctx::init(const vxdna_context &ctx,
-                                 const struct amdxdna_ccmd_create_ctx_req *req) noexcept
+void
+vxdna_context::vxdna_hwctx::
+poll_and_retire_pending(std::vector<std::shared_ptr<vaccel_fence>> &&copy_pending_fences)
+{
+    for (auto &fence : copy_pending_fences) {
+        uint64_t sync_point = fence->get_sync_point();
+        drm_syncobj_timeline_wait arg = {};
+        arg.handles = reinterpret_cast<uintptr_t>(&syncobj_handle);
+        arg.points = reinterpret_cast<uintptr_t>(&sync_point);
+        arg.timeout_nsec = fence->get_timeout_nsec();
+        arg.count_handles = 1;
+        /* Keep waiting even if not submitted yet */
+        arg.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+        auto ret = ioctl(ctx_fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &arg);
+        if (ret)
+            vxdna_err("vxdna_hwctx::poll_and_retire_pending: Wait for fence failed ret %d, errno %d",
+                      ret, errno);
+        // Fence is retired, write fence callback
+        write_fence_callback(cookie, ctx_id, hwctx_handle, fence->get_id());
+    }
+}
+
+vxdna_context::vxdna_hwctx::
+vxdna_hwctx(const vxdna &device, const vxdna_context &ctx,
+     const struct amdxdna_ccmd_create_ctx_req *req)
 {
     hwctx_handle = AMDXDNA_INVALID_CTX_HANDLE;
     syncobj_handle = AMDXDNA_INVALID_FENCE_HANDLE;
     ctx_fd = ctx.get_fd();
 
+    // Request XDNA driver to create a hardware context
     struct amdxdna_drm_create_hwctx args = {};
     args.max_opc = req->max_opc;
     args.num_tiles = req->num_tiles;
@@ -158,17 +197,51 @@ vxdna_context::vxdna_hwctx::init(const vxdna_context &ctx,
 
     int ret = ioctl(ctx.get_fd(), DRM_IOCTL_AMDXDNA_CREATE_HWCTX, &args);
     if (ret)
-        return -errno;
+        VACCEL_THROW_MSG(-errno, "Create hw context failed ret %d, errno %d", ret, errno);
+
+    if (args.handle == AMDXDNA_INVALID_CTX_HANDLE)
+        VACCEL_THROW_MSG(-EINVAL, "Create hw context failed, returns invalid hwctx handle");
 
     hwctx_handle = args.handle;
     syncobj_handle = args.syncobj_handle;
+    write_fence_callback = device.get_callbacks()->write_context_fence;
+    if (!write_fence_callback)
+        VACCEL_THROW_MSG(-EINVAL, "Write fence callback not found");
 
-    return 0;
+    cookie = device.get_cookie();
+    ctx_id = ctx.get_id();
+
+    // Start polling thread to retire fences
+    stop_polling.store(false, std::memory_order_relaxed);
+    polling_thread = std::thread([this]() {
+        while (!stop_polling.load(std::memory_order_relaxed)) {
+            std::unique_lock<std::mutex> lock(fences_lock);
+            cv.wait(lock, [this] {
+                return stop_polling.load(std::memory_order_relaxed) || !pending_fences.empty();
+            });
+            if (stop_polling.load(std::memory_order_relaxed))
+                break;
+            std::vector<std::shared_ptr<vaccel_fence>> tmp_pending_fences = std::move(pending_fences);
+            lock.unlock();
+            poll_and_retire_pending(std::move(tmp_pending_fences));
+        }
+    });
 }
 
-void
-vxdna_context::vxdna_hwctx::finish() noexcept
+vxdna_context::vxdna_hwctx::
+~vxdna_hwctx()
 {
+    vxdna_dbg("HW context finishing: ctx_id=%u, hwctx_handle=%u", ctx_id, hwctx_handle);
+    // Signal polling thread to stop
+    stop_polling.store(true, std::memory_order_relaxed);
+    cv.notify_all();
+    
+    // Wait for polling thread to finish
+    if (polling_thread.joinable()) {
+        polling_thread.join();
+    }
+
+    // Destroy sync object and hardware context
     if (syncobj_handle != AMDXDNA_INVALID_FENCE_HANDLE) {
         struct drm_syncobj_destroy arg = {};
         arg.handle = syncobj_handle;
@@ -177,6 +250,7 @@ vxdna_context::vxdna_hwctx::finish() noexcept
             vxdna_err("Destroy sync object failed ret %d", ret);
         syncobj_handle = AMDXDNA_INVALID_FENCE_HANDLE;
     }
+    // Destroy hardware context
     if (hwctx_handle != AMDXDNA_INVALID_CTX_HANDLE) {
         struct amdxdna_drm_destroy_hwctx arg = {};
         arg.handle = hwctx_handle;
@@ -188,7 +262,63 @@ vxdna_context::vxdna_hwctx::finish() noexcept
 }
 
 void
-vxdna_context::create_bo(const vxdna &device, const struct amdxdna_ccmd_create_bo_req *req)
+vxdna_context::vxdna_hwctx::
+config(const struct amdxdna_ccmd_config_ctx_req *req)
+{
+    struct amdxdna_drm_config_hwctx args = {};
+    args.handle = hwctx_handle;
+    args.param_type = req->param_type;
+    args.param_val_size = req->param_val_size;
+    if (req->param_val_size)
+        args.param_val = (uint64_t)req->param_val;
+    else
+        args.param_val = req->inline_param;
+    auto ret = ioctl(ctx_fd, DRM_IOCTL_AMDXDNA_CONFIG_HWCTX, &args);
+    if (ret)
+        VACCEL_THROW_MSG(-errno, "Config hw context failed ret %d", ret);
+}
+
+uint64_t
+vxdna_context::vxdna_hwctx::
+exec_cmd(const struct amdxdna_ccmd_exec_cmd_req *req)
+{
+    struct amdxdna_drm_exec_cmd args = {};
+    args.hwctx = hwctx_handle;
+    args.type = req->type;
+    args.cmd_count = req->cmd_count;
+    if (req->cmd_count > 1)
+        args.cmd_handles = (uint64_t)req->cmds_n_args;
+    else
+        args.cmd_handles = req->cmds_n_args[0];
+
+    args.arg_count = req->arg_count;
+    args.args = (uint64_t)(req->cmds_n_args + req->arg_offset);
+    auto ret = ioctl(ctx_fd, DRM_IOCTL_AMDXDNA_EXEC_CMD, &args);
+    if (ret)
+        VACCEL_THROW_MSG(-errno, "Exec cmd failed ret %d", ret);
+    return args.seq;
+}
+
+void
+vxdna_context::
+vxdna_hwctx::
+submit_fence(uint64_t fence_id)
+{
+    std::lock_guard<std::mutex> lock(fences_lock);
+    if (!has_sync_point) {
+        // Fence is not submitted yet, write fence callback directly
+        write_fence_callback(cookie, ctx_id, hwctx_handle, fence_id);
+        return;
+    }
+    auto fence = std::make_shared<vaccel_fence>(fence_id, sync_point, syncobj_handle, hwctx_handle, timeout_nsec);
+    pending_fences.push_back(std::move(fence));
+    has_sync_point = false;
+    cv.notify_one();
+}
+
+void
+vxdna_context::
+create_bo(const vxdna &device, const struct amdxdna_ccmd_create_bo_req *req)
 {
     std::shared_ptr<vxdna_bo> xdna_bo;
     if (req->bo_type != AMDXDNA_BO_DEV) {
@@ -213,44 +343,179 @@ vxdna_context::create_bo(const vxdna &device, const struct amdxdna_ccmd_create_b
 }
 
 void
-vxdna_context::add_bo(std::shared_ptr<vxdna_bo> &&bo)
+vxdna_context::
+add_bo(std::shared_ptr<vxdna_bo> &&bo)
 {
     bo_table.insert(bo->get_handle(), std::move(bo));
 }
 
 void
-vxdna_context::remove_bo(uint32_t handle)
+vxdna_context::
+remove_bo(uint32_t handle)
 {
     bo_table.erase(handle);
 }
 
 void
-vxdna_context::create_hwctx(const struct amdxdna_ccmd_create_ctx_req *req)
+vxdna_context::
+create_hwctx(const vxdna &device, const struct amdxdna_ccmd_create_ctx_req *req)
 {
     struct amdxdna_ccmd_create_ctx_rsp rsp = {};
-    auto [hwctx_idx, hwctx] = hwctx_table.alloc();
-    auto ret = hwctx->init(*this, req);
-    if (ret) {
-        hwctx_table.free(hwctx_idx);
-        VACCEL_THROW_MSG(-errno, "Create hw context failed ret %d", ret);
-    }
-
+    auto hwctx = std::make_shared<vxdna_hwctx>(device, *this, req);
     rsp.hdr.base.len = sizeof(rsp);
-    rsp.handle = hwctx_idx;
+    rsp.handle = hwctx->get_handle();
+    hwctx_table.insert(hwctx->get_handle(), std::move(hwctx));
+
     write_rsp(&rsp, sizeof(rsp), req->hdr.rsp_off);
 }
 
 void
-vxdna_context::remove_hwctx(uint32_t handle)
+vxdna_context::
+remove_hwctx(uint32_t handle)
 {
-    auto hwctx = hwctx_table.get(handle);
-    if (hwctx)
-        hwctx->finish();
-    hwctx_table.free(handle);
+    hwctx_table.erase(handle);
 }
 
 void
-vxdna_context::write_err_rsp(int err)
+vxdna_context::
+config_hwctx(const struct amdxdna_ccmd_config_ctx_req *req)
+{
+    auto hwctx = hwctx_table.lookup(req->handle);
+    if (!hwctx)
+        VACCEL_THROW_MSG(-EINVAL, "HW context not found handle %u", req->handle);
+    hwctx->config(req);
+}
+
+void
+vxdna_context::
+submit_fence(uint32_t ring_idx, uint64_t fence_id)
+{
+    auto hwctx = hwctx_table.lookup(ring_idx);
+    if (!hwctx)
+        VACCEL_THROW_MSG(-EINVAL, "HW context not found ring_idx %u", ring_idx);
+    hwctx->submit_fence(fence_id);
+}
+
+void
+vxdna_context::
+exec_cmd(const struct amdxdna_ccmd_exec_cmd_req *req)
+{
+    auto hwctx = hwctx_table.lookup(req->ctx_handle);
+    if (!hwctx)
+        VACCEL_THROW_MSG(-EINVAL, "HW context not found handle %u", req->ctx_handle);
+    struct amdxdna_ccmd_exec_cmd_rsp rsp = {};
+    rsp.seq = hwctx->exec_cmd(req);
+    rsp.hdr.base.len = sizeof(rsp); 
+    write_rsp(&rsp, sizeof(rsp), req->hdr.rsp_off);
+}
+
+void
+vxdna_context::
+wait_cmd(const struct amdxdna_ccmd_wait_cmd_req *req)
+{
+    auto hwctx = hwctx_table.lookup(req->ctx_handle);
+    if (!hwctx)
+        VACCEL_THROW_MSG(-EINVAL, "HW context not found handle %u", req->ctx_handle);
+    hwctx->set_sync_point(req->seq);
+    write_err_rsp(0); // Success
+}
+
+void
+vxdna_context::
+get_info(const vxdna &device, const struct amdxdna_ccmd_get_info_req *req)
+{
+    auto res = device.get_resource(req->info_res);
+    if (!res)
+        VACCEL_THROW_MSG(-EINVAL, "%s, Did not find info resource, res_id %u", __func__, req->info_res);
+
+    struct amdxdna_drm_get_array array_args = {};
+    struct amdxdna_ccmd_get_info_rsp rsp = {};
+    struct amdxdna_drm_get_info args = {};
+    uint32_t info_size;
+    unsigned long cmd;
+    void *pargs;
+    int ret;
+
+    if (req->num_element) {
+        // Check for integer overflow
+        if (req->size > 0 && req->num_element > UINT32_MAX / req->size)
+            VACCEL_THROW_MSG(-EINVAL, "Info size overflow: size=%u, num_element=%u", 
+                             req->size, req->num_element);
+        info_size = req->size * req->num_element;
+        array_args.param = req->param;
+        array_args.element_size = req->size;
+        array_args.num_element = req->num_element;
+        cmd = DRM_IOCTL_AMDXDNA_GET_ARRAY;
+        pargs = &array_args;
+    } else {
+        info_size = req->size;
+        args.param = req->param;
+        args.buffer_size = req->size;
+        cmd = DRM_IOCTL_AMDXDNA_GET_INFO;
+        pargs = &args;
+    }
+
+    std::vector<uint8_t> info_buf(info_size);
+    // Read argument data from resource
+    res->read(0, info_buf.data(), info_size);
+    if (req->num_element) {
+        array_args.buffer = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(info_buf.data()));
+    } else {
+        args.buffer = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(info_buf.data()));
+    }
+
+    ret = ioctl(get_fd(), cmd, pargs);
+    if (ret)
+        VACCEL_THROW_MSG(-errno, "Get info failed ret %d, errno %d", ret, errno);
+
+    if (cmd == DRM_IOCTL_AMDXDNA_GET_ARRAY) {
+        rsp.num_element = array_args.num_element;
+        rsp.size = array_args.element_size;
+        info_size = array_args.element_size * array_args.num_element;
+    } else {
+        rsp.size = args.buffer_size;
+        info_size = args.buffer_size;
+    }
+
+    res->write(0, info_buf.data(), info_size);
+    rsp.hdr.base.len = sizeof(rsp);
+    write_rsp(&rsp, sizeof(rsp), req->hdr.rsp_off);
+}
+
+void
+vxdna_context::
+read_sysfs(const struct amdxdna_ccmd_read_sysfs_req *req)
+{
+    struct amdxdna_ccmd_read_sysfs_rsp rsp = {};
+    std::string path;
+    struct stat st = {};
+    int ret;
+
+    ret = fstat(get_fd(), &st);
+    if (ret)
+        VACCEL_THROW_MSG(-errno, "fstat failed ret %d, errno %d", ret, errno);
+
+    std::ostringstream oss;
+    oss << "/sys/dev/char/" << major(st.st_rdev) << ":" << minor(st.st_rdev) << "/device/" << req->node_name;
+    path = oss.str();
+
+    // Open the sysfs file in binary mode and read the full contents into a buffer.
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open())
+        VACCEL_THROW_MSG(-errno, "Open %s failed, errno %d", path.c_str(), errno);
+
+    //Read all content into buffer
+    std::vector<uint8_t> buffer((std::istreambuf_iterator<char>(file)),
+                                std::istreambuf_iterator<char>());
+    rsp.val_len = buffer.size();
+    rsp.hdr.base.len = sizeof(rsp) + rsp.val_len;
+    write_rsp(&rsp, sizeof(rsp), req->hdr.rsp_off);
+    write_rsp(buffer.data(), buffer.size(), req->hdr.rsp_off + sizeof(rsp));
+}
+
+void
+vxdna_context::
+write_err_rsp(int err)
 {
     auto resp_res = get_resp_res();
     if (!resp_res)
@@ -259,7 +524,8 @@ vxdna_context::write_err_rsp(int err)
 }
 
 void
-vxdna_context::write_rsp(const void *rsp, size_t rsp_size, uint32_t rsp_off)
+vxdna_context::
+write_rsp(const void *rsp, size_t rsp_size, uint32_t rsp_off)
 {
     auto resp_res = get_resp_res();
     if (!resp_res)
@@ -268,7 +534,8 @@ vxdna_context::write_rsp(const void *rsp, size_t rsp_size, uint32_t rsp_off)
 }
 
 void
-vxdna::get_capset_info(uint32_t *max_version, uint32_t *max_size)
+vxdna::
+get_capset_info(uint32_t *max_version, uint32_t *max_size)
 {
     /* Return max version if requested */
     if (max_version)
@@ -280,7 +547,8 @@ vxdna::get_capset_info(uint32_t *max_version, uint32_t *max_size)
 }
 
 void
-vxdna::fill_capset(uint32_t capset_size, void *capset_buf)
+vxdna::
+fill_capset(uint32_t capset_size, void *capset_buf)
 {
     vxdna_dbg("Filling capset for capset_id=%u, capset_version=%u, capset_size=%zu",
               get_capset_id(), vxdna::capset.max_version, sizeof(vxdna::capset));
@@ -296,7 +564,8 @@ vxdna::fill_capset(uint32_t capset_size, void *capset_buf)
 }
 
 void
-vxdna::create_ctx(uint32_t ctx_id, uint32_t ctx_flags, uint32_t nlen, const char *name)
+vxdna::
+create_ctx(uint32_t ctx_id, uint32_t ctx_flags, uint32_t nlen, const char *name)
 {
     vxdna_dbg("Creating execution ctx: ctx_id=%u, flags=0x%x, nlen=%u, name=%s",
               ctx_id, ctx_flags, nlen, name ? name : "(null)");
@@ -316,10 +585,22 @@ vxdna::create_ctx(uint32_t ctx_id, uint32_t ctx_flags, uint32_t nlen, const char
 }
 
 void
-vxdna::destroy_ctx(uint32_t ctx_id)
+vxdna::
+destroy_ctx(uint32_t ctx_id)
 {
     remove_ctx(ctx_id);
     vxdna_dbg("Context destroyed: ctx_id=%u", ctx_id);
+}
+
+void
+vxdna::
+destroy_resource(const std::shared_ptr<vaccel_resource> &res)
+{
+    (void)res;
+    // Required by vaccel<T>::destroy_resource
+    // TODO: it is not required for now as guest xdna shim virtio
+    // driver already ensure the sequence by creating the resource
+    // blob and then create the BO and does in reverse order when destroying.
 }
 
 // Forward declarations of handler functions (to be implemented elsewhere)
@@ -373,7 +654,7 @@ vxdna_ccmd_create_ctx(vxdna &device, const std::shared_ptr<vxdna_context>& ctx, 
     auto *req = static_cast<const struct amdxdna_ccmd_create_ctx_req *>(hdr);
 
     vxdna_ccmd_error_wrap(ctx, [&]() {
-        ctx->create_hwctx(req);
+        ctx->create_hwctx(device, req);
     });
 }
 
@@ -387,6 +668,59 @@ vxdna_ccmd_destroy_ctx(vxdna &device, const std::shared_ptr<vxdna_context>& ctx,
         ctx->remove_hwctx(req->handle);
     });
 }
+
+static void
+vxdna_ccmd_config_ctx(vxdna &device, const std::shared_ptr<vxdna_context>& ctx, const void *hdr)
+{
+    (void)device;
+    auto *req = static_cast<const struct amdxdna_ccmd_config_ctx_req *>(hdr);
+
+    vxdna_ccmd_error_wrap(ctx, [&]() {
+        ctx->config_hwctx(req);
+    });
+}
+
+static void
+vxdna_ccmd_exec_cmd(vxdna &device, const std::shared_ptr<vxdna_context>& ctx, const void *hdr)
+{
+    (void)device;
+    auto *req = static_cast<const struct amdxdna_ccmd_exec_cmd_req *>(hdr);
+
+    vxdna_ccmd_error_wrap(ctx, [&]() {
+        ctx->exec_cmd(req);
+    });
+}
+
+static void
+vxdna_ccmd_wait_cmd(vxdna &device, const std::shared_ptr<vxdna_context>& ctx, const void *hdr)
+{
+    (void)device;
+    auto *req = static_cast<const struct amdxdna_ccmd_wait_cmd_req *>(hdr);
+
+    vxdna_ccmd_error_wrap(ctx, [&]() {
+        ctx->wait_cmd(req);
+    });
+}
+
+static void
+vxdna_ccmd_get_info(vxdna &device, const std::shared_ptr<vxdna_context>& ctx, const void *hdr)
+{
+    auto *req = static_cast<const struct amdxdna_ccmd_get_info_req *>(hdr);
+    vxdna_ccmd_error_wrap(ctx, [&]() {
+        ctx->get_info(device, req);
+    });
+}
+
+static void
+vxdna_ccmd_read_sysfs(vxdna &device, const std::shared_ptr<vxdna_context>& ctx, const void *hdr)
+{
+    (void)device;
+    auto *req = static_cast<const struct amdxdna_ccmd_read_sysfs_req *>(hdr);
+    vxdna_ccmd_error_wrap(ctx, [&]() {
+        ctx->read_sysfs(req);
+    });
+}
+
 // Definition of the CCMD handler type for AMDXDNA
 using amdxdna_ccmd_handler_t = void(*)(vxdna &device,
     const std::shared_ptr<vxdna_context>& ctx,
@@ -418,10 +752,16 @@ constexpr std::array<amdxdna_ccmd_dispatch_entry, 11> amdxdna_ccmd_dispatch_tabl
     AMD_CCMD_DISPATCH_ENTRY(destroy_bo),
     AMD_CCMD_DISPATCH_ENTRY(create_ctx),
     AMD_CCMD_DISPATCH_ENTRY(destroy_ctx),
+    AMD_CCMD_DISPATCH_ENTRY(config_ctx),
+    AMD_CCMD_DISPATCH_ENTRY(exec_cmd),
+    AMD_CCMD_DISPATCH_ENTRY(wait_cmd),
+    AMD_CCMD_DISPATCH_ENTRY(get_info),
+    AMD_CCMD_DISPATCH_ENTRY(read_sysfs),
 }};
 
 void
-vxdna::dispatch_ccmd(std::shared_ptr<vxdna_context> &ctx, const struct vdrm_ccmd_req *hdr)
+vxdna::
+dispatch_ccmd(std::shared_ptr<vxdna_context> &ctx, const struct vdrm_ccmd_req *hdr)
 {
     if (hdr->cmd > ARRAY_SIZE(amdxdna_ccmd_dispatch_table))
         VACCEL_THROW_MSG(-EINVAL, "invalid cmd: %u", hdr->cmd);
@@ -456,18 +796,13 @@ vxdna::dispatch_ccmd(std::shared_ptr<vxdna_context> &ctx, const struct vdrm_ccmd
 }
 
 void
-vxdna::create_fence(uint32_t ctx_id, uint32_t flags, uint32_t ring_idx, uint32_t *fence_id)
+vxdna::
+submit_fence(uint32_t ctx_id, uint32_t flags, uint32_t ring_idx, uint64_t fence_id)
 {
-    vxdna_dbg("Creating fence: ctx_id=%u, flags=0x%x, ring_idx=%u", ctx_id, flags, ring_idx);
-    (void)ctx_id;
-    (void)flags;
-    (void)ring_idx;
-    (void)fence_id;
-}
-
-void
-vxdna::destroy_fence(uint32_t fence_id)
-{
-    vxdna_dbg("Destroying fence: fence_id=%u", fence_id);
-    (void)fence_id;
+    vxdna_dbg("Submitting fence: ctx_id=%u, flags=0x%x, ring_idx=%u, fence_id=%lu",
+              ctx_id, flags, ring_idx, fence_id);
+    auto ctx = get_ctx(ctx_id);
+    if (!ctx)
+        VACCEL_THROW_MSG(-EINVAL, "Context not found");
+    ctx->submit_fence(ring_idx, fence_id);
 }

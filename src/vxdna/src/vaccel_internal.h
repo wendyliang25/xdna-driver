@@ -15,16 +15,21 @@
 #ifndef VACCEL_INTERNAL_H
 #define VACCEL_INTERNAL_H
 
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
-#include <stdint.h>
-#include <stddef.h>
-#include <sys/mman.h>
-#ifdef __unix__
-#include <unistd.h>
-#endif
+#include <functional>
 #include <unordered_map>
 #include <memory>
 #include <mutex>
+#include <stdint.h>
+#include <stddef.h>
+#include <sys/mman.h>
+#include <thread>
+#ifdef __unix__
+#include <unistd.h>
+#endif
+#include <vector>
 
 #include "vaccel_error.h"
 #include "../include/vaccel_renderer.h"
@@ -97,59 +102,6 @@ public:
 private:
     std::unordered_map<Key, Value> _map;
     mutable std::mutex _mtx;
-};
-
-// A simple fixed-capacity handle table with allocation/free;
-// alloc() returns both index and a pointer to the element.
-template <typename T, size_t N>
-class vaccel_array {
-public:
-    vaccel_array() : slots{}, used{} {}
-
-    // Find and occupy a free element; returns pair {handle, ptr}
-    // If no free slot, returns {-1, nullptr}
-    std::pair<int, T*> alloc() {
-        for (size_t i = 0; i < N; ++i) {
-            if (!used[i]) {
-                used[i] = true;
-                slots[i] = T{};
-                return {static_cast<int>(i), &slots[i]};
-            }
-        }
-        return {-1, nullptr};
-    }
-
-    // Return reference to element at index (handle); nullptr if invalid.
-    T* get(int handle) {
-        if (handle < 0 || static_cast<size_t>(handle) >= N) return nullptr;
-        if (!used[handle]) return nullptr;
-        return &slots[handle];
-    }
-    const T* get(int handle) const {
-        if (handle < 0 || static_cast<size_t>(handle) >= N) return nullptr;
-        if (!used[handle]) return nullptr;
-        return &slots[handle];
-    }
-
-    // Free the element at given handle (index), does not shrink capacity.
-    bool free(int handle) {
-        if (handle < 0 || static_cast<size_t>(handle) >= N) return false;
-        if (!used[handle]) return false;
-        used[handle] = false;
-        slots[handle] = T{};
-        return true;
-    }
-
-    // Check if handle is valid and occupied
-    bool valid(int handle) const {
-        return handle >= 0 && static_cast<size_t>(handle) < N && used[handle];
-    }
-
-    size_t capacity() const { return N; }
-
-private:
-    T slots[N];
-    bool used[N];
 };
 
 /**
@@ -240,6 +192,34 @@ public:
     }
 
     uint32_t
+    read(uint32_t offset, void *buf, uint32_t size)
+    {
+        uint32_t bytes_read = 0;
+        for (uint32_t i = 0; i < num_iovecs; i++) {
+            if (offset >= iovecs[i].iov_len) {
+                offset -= iovecs[i].iov_len;
+                continue;
+            }
+            uint32_t len = size;
+            if (len > iovecs[i].iov_len - offset)
+                 len = iovecs[i].iov_len - offset;
+            void *src = static_cast<void *>(static_cast<uint8_t *>(iovecs[i].iov_base) + offset);
+            std::memcpy(buf, src, len);
+
+            buf = static_cast<void *>(static_cast<uint8_t *>(buf) + len);
+            size -= len;
+            bytes_read += len;
+            offset = 0;
+        }
+
+        if (size > 0)
+            VACCEL_THROW_MSG(-EINVAL, "buffer from res is too big, %u bytes remaining, %u bytes read",
+                             size, bytes_read);
+
+        return bytes_read;
+    }
+
+    uint32_t
     get_iovecs(const struct vaccel_iovec **iovecs_out) const noexcept
     {
         *iovecs_out = iovecs;
@@ -304,16 +284,51 @@ private:
  */
 class vaccel_fence {
 public:
-    vaccel_fence(uint64_t id_in, int fd_in, uint32_t ring_idx_in)
+    vaccel_fence(uint64_t id_in, uint64_t sync_point_in,
+                 uint32_t syncobj_handle_in, uint32_t ring_idx_in,
+                 int64_t timeout_nsec_in)
         : id(id_in)
-        , fd(fd_in)
+        , sync_point(sync_point_in)
+        , syncobj_handle(syncobj_handle_in)
         , ring_idx(ring_idx_in)
+        , timeout_nsec(timeout_nsec_in)
     {}
+
+    uint64_t
+    get_sync_point() const noexcept
+    {
+        return sync_point;
+    }
+
+    uint32_t
+    get_syncobj_handle() const noexcept
+    {
+        return syncobj_handle;
+    }
+
+    uint32_t
+    get_ring_idx() const noexcept
+    {
+        return ring_idx;
+    }
+
+    uint64_t
+    get_id() const noexcept
+    {
+        return id;
+    }
+
+    int64_t
+    get_timeout_nsec() const noexcept
+    {
+        return timeout_nsec;
+    }
 private:
     uint64_t id;               /**< Fence ID (64-bit timeline value) */
-    int fd;                    /**< Sync file FD or -1 */
+    uint64_t sync_point;       /**< Sync point */
+    uint32_t syncobj_handle;   /**< Syncobj handle */
     uint32_t ring_idx;         /**< Timeline/ring index */
-    struct timespec timestamp; /**< Creation time for hung detection */
+    int64_t timeout_nsec;      /**< Timeout in nanoseconds */
 };
 
 template <typename M>
@@ -363,9 +378,9 @@ public:
 
     // Disable copy and move
     vaccel(const vaccel&) = delete;
-    vaccel& operator=(const vaccel&) = delete;
-    vaccel(vaccel&&) = delete;
-    vaccel& operator=(vaccel&&) = delete;
+    vaccel& operator=(const vaccel&) = default;
+    vaccel(vaccel&&) = default;
+    vaccel& operator=(vaccel&&) = default;
 
     void
     get_capset_info(uint32_t *max_version, uint32_t *max_size)
@@ -440,7 +455,8 @@ public:
         auto res = get_resource(res_id);
         if (!res)
             VACCEL_THROW_MSG(-ENOENT, "Resource not found: res_id=%u", res_id);
-        static_cast<T*>(this)->destroy_resource(res_id);
+        static_cast<T*>(this)->destroy_resource(res);
+        resource_table.erase(res_id);
     }
 
     int
@@ -483,9 +499,9 @@ public:
         fence_table.erase(fence_id);
     }
 
-    void create_fence(uint32_t ctx_id, uint32_t flags, uint32_t ring_idx, uint32_t *fence_id)
+    void submit_fence(uint32_t ctx_id, uint32_t flags, uint32_t ring_idx, uint64_t fence_id)
     {
-        static_cast<T*>(this)->create_fence(ctx_id, flags, ring_idx, fence_id); 
+        static_cast<T*>(this)->submit_fence(ctx_id, flags, ring_idx, fence_id); 
     }
 
     void
@@ -498,6 +514,12 @@ public:
     dispatch_ccmd(std::shared_ptr<ContextType> &ctx, const struct vdrm_ccmd_req *hdr)
     {
         static_cast<T*>(this)->dispatch_ccmd(ctx, hdr);
+    }
+
+    const struct vaccel_callbacks *
+    get_callbacks() const noexcept
+    {
+        return callbacks;
     }
 
 private:
