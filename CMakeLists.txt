@@ -6,6 +6,9 @@ project("amd-xdna")
 set(PROJECT_DESCRIPTION "AMD XDNA driver and SHIM for Linux")
 option(SKIP_KMOD "Building and packaging SHIM without driver and firmware" 1)
 
+# Export compile commands for IDE support (Cursor, VSCode, etc.)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 if (DEFINED ENV{XRT_PLUGIN_VERSION_PATCH})
   SET(XRT_PLUGIN_VERSION_PATCH $ENV{XRT_PLUGIN_VERSION_PATCH})
 else()
