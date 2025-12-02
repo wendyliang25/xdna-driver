@@ -1002,7 +1002,8 @@ int aie2_cmd_submit(struct amdxdna_ctx *ctx, struct amdxdna_sched_job *job,
 		goto rq_yield;
 	}
 
-#ifdef HAVE_6_17_drm_sched_job_init
+//#ifdef HAVE_6_17_drm_sched_job_init
+#if 1
 	ret = drm_sched_job_init(&job->base, &ctx->priv->entity, 1, ctx,
 				 ctx->client->filp->client_id);
 #else
