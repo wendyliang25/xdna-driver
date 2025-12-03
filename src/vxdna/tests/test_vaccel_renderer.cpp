@@ -808,6 +808,477 @@ TEST_F(VaccelRendererTest, SubmitCcmdInvalidCommand) {
 }
 
 // =============================================================================
+// AMDXDNA_CCMD_GET_INFO Tests
+// =============================================================================
+
+TEST_F(VaccelRendererTest, SubmitCcmdGetInfoNoContext) {
+    if (drm_fd_ < 0) {
+        GTEST_SKIP() << "No DRM device available";
+    }
+
+    // Create device
+    int ret = createTestDevice(VIRACCEL_CAPSET_ID_AMDXDNA);
+    ASSERT_EQ(ret, 0);
+
+    // Try to submit GET_INFO without creating a context
+    struct amdxdna_ccmd_get_info_req get_info_cmd = {};
+    get_info_cmd.hdr.cmd = AMDXDNA_CCMD_GET_INFO;
+    get_info_cmd.hdr.len = sizeof(get_info_cmd);
+    get_info_cmd.param = 0;
+    get_info_cmd.size = 64;
+    get_info_cmd.num_element = 0;
+    get_info_cmd.info_res = 1;
+
+    ret = vaccel_submit_ccmd(cookie_, 999, &get_info_cmd, sizeof(get_info_cmd));
+    EXPECT_EQ(ret, -ENOENT) << "Should fail without context";
+}
+
+TEST_F(VaccelRendererTest, SubmitCcmdGetInfoNoInit) {
+    if (drm_fd_ < 0) {
+        GTEST_SKIP() << "No DRM device available";
+    }
+
+    // Create device
+    int ret = createTestDevice(VIRACCEL_CAPSET_ID_AMDXDNA);
+    ASSERT_EQ(ret, 0);
+
+    // Create a context
+    uint32_t ctx_id = 1;
+    ret = vaccel_create_ctx_with_flags(cookie_, ctx_id, 0, 0, nullptr);
+    ASSERT_EQ(ret, 0);
+
+    // Try GET_INFO without INIT (no response resource set)
+    struct amdxdna_ccmd_get_info_req get_info_cmd = {};
+    get_info_cmd.hdr.cmd = AMDXDNA_CCMD_GET_INFO;
+    get_info_cmd.hdr.len = sizeof(get_info_cmd);
+    get_info_cmd.param = 0;
+    get_info_cmd.size = 64;
+    get_info_cmd.num_element = 0;
+    get_info_cmd.info_res = 1;
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, &get_info_cmd, sizeof(get_info_cmd));
+    EXPECT_LT(ret, 0) << "Should fail without INIT command";
+}
+
+TEST_F(VaccelRendererTest, SubmitCcmdGetInfoInvalidResource) {
+    if (drm_fd_ < 0) {
+        GTEST_SKIP() << "No DRM device available";
+    }
+
+    // Create device and context
+    int ret = createTestDevice(VIRACCEL_CAPSET_ID_AMDXDNA);
+    ASSERT_EQ(ret, 0);
+
+    uint32_t ctx_id = 1;
+    ret = vaccel_create_ctx_with_flags(cookie_, ctx_id, 0, 0, nullptr);
+    ASSERT_EQ(ret, 0);
+
+    // Create response resource
+    std::vector<uint8_t> resp_buf(4096);
+    struct vaccel_iovec resp_iov = {
+        .iov_base = resp_buf.data(),
+        .iov_len = resp_buf.size()
+    };
+
+    struct vaccel_create_resource_blob_args resp_res_args = {};
+    resp_res_args.res_handle = 100;
+    resp_res_args.size = resp_buf.size();
+    resp_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    resp_res_args.iovecs = &resp_iov;
+    resp_res_args.num_iovs = 1;
+
+    ret = vaccel_create_resource_blob(cookie_, &resp_res_args);
+    ASSERT_EQ(ret, 0);
+
+    // Send INIT command
+    struct amdxdna_ccmd_init_req init_cmd = {};
+    init_cmd.hdr.cmd = AMDXDNA_CCMD_INIT;
+    init_cmd.hdr.len = sizeof(init_cmd);
+    init_cmd.rsp_res_id = 100;
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, &init_cmd, sizeof(init_cmd));
+    EXPECT_EQ(ret, 0);
+
+    // Try GET_INFO with invalid info resource
+    struct amdxdna_ccmd_get_info_req get_info_cmd = {};
+    get_info_cmd.hdr.cmd = AMDXDNA_CCMD_GET_INFO;
+    get_info_cmd.hdr.len = sizeof(get_info_cmd);
+    get_info_cmd.hdr.rsp_off = 0;
+    get_info_cmd.param = 0;
+    get_info_cmd.size = 64;
+    get_info_cmd.num_element = 0;
+    get_info_cmd.info_res = 999; // Invalid resource ID
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, &get_info_cmd, sizeof(get_info_cmd));
+    EXPECT_LT(ret, 0) << "Should fail with invalid info resource";
+}
+
+TEST_F(VaccelRendererTest, SubmitCcmdGetInfoSingleValue) {
+    if (drm_fd_ < 0) {
+        GTEST_SKIP() << "No DRM device available";
+    }
+
+    // Create device and context
+    int ret = createTestDevice(VIRACCEL_CAPSET_ID_AMDXDNA);
+    ASSERT_EQ(ret, 0);
+
+    uint32_t ctx_id = 1;
+    ret = vaccel_create_ctx_with_flags(cookie_, ctx_id, 0, 0, nullptr);
+    ASSERT_EQ(ret, 0);
+
+    // Create response resource
+    std::vector<uint8_t> resp_buf(4096);
+    struct vaccel_iovec resp_iov = {
+        .iov_base = resp_buf.data(),
+        .iov_len = resp_buf.size()
+    };
+
+    struct vaccel_create_resource_blob_args resp_res_args = {};
+    resp_res_args.res_handle = 100;
+    resp_res_args.size = resp_buf.size();
+    resp_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    resp_res_args.iovecs = &resp_iov;
+    resp_res_args.num_iovs = 1;
+
+    ret = vaccel_create_resource_blob(cookie_, &resp_res_args);
+    ASSERT_EQ(ret, 0);
+
+    // Create info resource
+    std::vector<uint8_t> info_buf(4096);
+    struct vaccel_iovec info_iov = {
+        .iov_base = info_buf.data(),
+        .iov_len = info_buf.size()
+    };
+
+    struct vaccel_create_resource_blob_args info_res_args = {};
+    info_res_args.res_handle = 101;
+    info_res_args.size = info_buf.size();
+    info_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    info_res_args.iovecs = &info_iov;
+    info_res_args.num_iovs = 1;
+
+    ret = vaccel_create_resource_blob(cookie_, &info_res_args);
+    ASSERT_EQ(ret, 0);
+
+    // Send INIT command
+    struct amdxdna_ccmd_init_req init_cmd = {};
+    init_cmd.hdr.cmd = AMDXDNA_CCMD_INIT;
+    init_cmd.hdr.len = sizeof(init_cmd);
+    init_cmd.rsp_res_id = 100;
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, &init_cmd, sizeof(init_cmd));
+    EXPECT_EQ(ret, 0);
+
+    // Send GET_INFO command (single value)
+    struct amdxdna_ccmd_get_info_req get_info_cmd = {};
+    get_info_cmd.hdr.cmd = AMDXDNA_CCMD_GET_INFO;
+    get_info_cmd.hdr.len = sizeof(get_info_cmd);
+    get_info_cmd.hdr.rsp_off = 0;
+    get_info_cmd.param = DRM_AMDXDNA_QUERY_AIE_STATUS;
+    get_info_cmd.size = info_buf.size();
+    get_info_cmd.num_element = 0; // Single value
+    get_info_cmd.info_res = 101;
+    struct amdxdna_drm_query_aie_status *status = reinterpret_cast<struct amdxdna_drm_query_aie_status *>(info_buf.data());
+    status->buffer = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(info_buf.data())) + sizeof(struct amdxdna_drm_query_aie_status);
+    status->buffer_size = info_buf.size() - sizeof(struct amdxdna_drm_query_aie_status);
+    status->cols_filled = 0;
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, &get_info_cmd, sizeof(get_info_cmd));
+    EXPECT_EQ(ret, 0) << "GET_INFO command should succeed";
+
+    // Verify response was written
+    auto *rsp = reinterpret_cast<struct amdxdna_ccmd_get_info_rsp*>(resp_buf.data());
+    EXPECT_EQ(rsp->hdr.base.len, sizeof(struct amdxdna_ccmd_get_info_rsp));
+}
+
+TEST_F(VaccelRendererTest, SubmitCcmdGetInfoArray) {
+    if (drm_fd_ < 0) {
+        GTEST_SKIP() << "No DRM device available";
+    }
+
+    // Create device and context
+    int ret = createTestDevice(VIRACCEL_CAPSET_ID_AMDXDNA);
+    ASSERT_EQ(ret, 0);
+
+    uint32_t ctx_id = 1;
+    ret = vaccel_create_ctx_with_flags(cookie_, ctx_id, 0, 0, nullptr);
+    ASSERT_EQ(ret, 0);
+
+    // Create response resource
+    std::vector<uint8_t> resp_buf(4096);
+    struct vaccel_iovec resp_iov = {
+        .iov_base = resp_buf.data(),
+        .iov_len = resp_buf.size()
+    };
+
+    struct vaccel_create_resource_blob_args resp_res_args = {};
+    resp_res_args.res_handle = 100;
+    resp_res_args.size = resp_buf.size();
+    resp_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    resp_res_args.iovecs = &resp_iov;
+    resp_res_args.num_iovs = 1;
+
+    ret = vaccel_create_resource_blob(cookie_, &resp_res_args);
+    ASSERT_EQ(ret, 0);
+
+    // Create info resource (larger for array)
+    std::vector<uint8_t> info_buf(4096);
+    struct vaccel_iovec info_iov = {
+        .iov_base = info_buf.data(),
+        .iov_len = info_buf.size()
+    };
+
+    struct vaccel_create_resource_blob_args info_res_args = {};
+    info_res_args.res_handle = 101;
+    info_res_args.size = info_buf.size();
+    info_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    info_res_args.iovecs = &info_iov;
+    info_res_args.num_iovs = 1;
+
+    ret = vaccel_create_resource_blob(cookie_, &info_res_args);
+    ASSERT_EQ(ret, 0);
+
+    // Send INIT command
+    struct amdxdna_ccmd_init_req init_cmd = {};
+    init_cmd.hdr.cmd = AMDXDNA_CCMD_INIT;
+    init_cmd.hdr.len = sizeof(init_cmd);
+    init_cmd.rsp_res_id = 100;
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, &init_cmd, sizeof(init_cmd));
+    EXPECT_EQ(ret, 0);
+
+    // Send GET_INFO command (array)
+    struct amdxdna_ccmd_get_info_req get_info_cmd = {};
+    get_info_cmd.hdr.cmd = AMDXDNA_CCMD_GET_INFO;
+    get_info_cmd.hdr.len = sizeof(get_info_cmd);
+    get_info_cmd.hdr.rsp_off = 0;
+    get_info_cmd.param = DRM_AMDXDNA_HW_CONTEXT_ALL;
+    get_info_cmd.size = 32;
+    get_info_cmd.num_element = 4; // Array of 4 elements
+    get_info_cmd.info_res = 101;
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, &get_info_cmd, sizeof(get_info_cmd));
+    EXPECT_EQ(ret, 0) << "GET_INFO array command should succeed";
+
+    // Verify response was written
+    auto *rsp = reinterpret_cast<struct amdxdna_ccmd_get_info_rsp*>(resp_buf.data());
+    EXPECT_EQ(rsp->hdr.base.len, sizeof(struct amdxdna_ccmd_get_info_rsp));
+}
+
+// =============================================================================
+// AMDXDNA_CCMD_READ_SYSFS Tests
+// =============================================================================
+
+TEST_F(VaccelRendererTest, SubmitCcmdReadSysfsNoContext) {
+    if (drm_fd_ < 0) {
+        GTEST_SKIP() << "No DRM device available";
+    }
+
+    // Create device
+    int ret = createTestDevice(VIRACCEL_CAPSET_ID_AMDXDNA);
+    ASSERT_EQ(ret, 0);
+
+    // Try to submit READ_SYSFS without creating a context
+    alignas(struct amdxdna_ccmd_read_sysfs_req) char cmd_buf[128];
+    auto *read_sysfs_cmd = reinterpret_cast<struct amdxdna_ccmd_read_sysfs_req*>(cmd_buf);
+    read_sysfs_cmd->hdr.cmd = AMDXDNA_CCMD_READ_SYSFS;
+    read_sysfs_cmd->hdr.len = sizeof(struct amdxdna_ccmd_read_sysfs_req) + strlen("device") + 1;
+    strcpy(read_sysfs_cmd->node_name, "device");
+
+    ret = vaccel_submit_ccmd(cookie_, 999, read_sysfs_cmd, sizeof(read_sysfs_cmd));
+    EXPECT_EQ(ret, -ENOENT) << "Should fail without context";
+}
+
+TEST_F(VaccelRendererTest, SubmitCcmdReadSysfsNoInit) {
+    if (drm_fd_ < 0) {
+        GTEST_SKIP() << "No DRM device available";
+    }
+
+    // Create device
+    int ret = createTestDevice(VIRACCEL_CAPSET_ID_AMDXDNA);
+    ASSERT_EQ(ret, 0);
+
+    // Create a context
+    uint32_t ctx_id = 1;
+    ret = vaccel_create_ctx_with_flags(cookie_, ctx_id, 0, 0, nullptr);
+    ASSERT_EQ(ret, 0);
+
+    // Try READ_SYSFS without INIT (no response resource set)
+    alignas(struct amdxdna_ccmd_read_sysfs_req) char cmd_buf[128];
+    auto *read_sysfs_cmd = reinterpret_cast<struct amdxdna_ccmd_read_sysfs_req*>(cmd_buf);
+    read_sysfs_cmd->hdr.cmd = AMDXDNA_CCMD_READ_SYSFS;
+    read_sysfs_cmd->hdr.len = sizeof(struct amdxdna_ccmd_read_sysfs_req) + strlen("device") + 1;
+    read_sysfs_cmd->hdr.rsp_off = 0;
+    strcpy(read_sysfs_cmd->node_name, "device");
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, read_sysfs_cmd, read_sysfs_cmd->hdr.len);
+    EXPECT_LT(ret, 0) << "Should fail without INIT command";
+}
+
+TEST_F(VaccelRendererTest, SubmitCcmdReadSysfsValidNode) {
+    if (drm_fd_ < 0) {
+        GTEST_SKIP() << "No DRM device available";
+    }
+
+    // Create device and context
+    int ret = createTestDevice(VIRACCEL_CAPSET_ID_AMDXDNA);
+    ASSERT_EQ(ret, 0);
+
+    uint32_t ctx_id = 1;
+    ret = vaccel_create_ctx_with_flags(cookie_, ctx_id, 0, 0, nullptr);
+    ASSERT_EQ(ret, 0);
+
+    // Create response resource (large enough for sysfs content)
+    std::vector<uint8_t> resp_buf(8192);
+    struct vaccel_iovec resp_iov = {
+        .iov_base = resp_buf.data(),
+        .iov_len = resp_buf.size()
+    };
+
+    struct vaccel_create_resource_blob_args resp_res_args = {};
+    resp_res_args.res_handle = 100;
+    resp_res_args.size = resp_buf.size();
+    resp_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    resp_res_args.iovecs = &resp_iov;
+    resp_res_args.num_iovs = 1;
+
+    ret = vaccel_create_resource_blob(cookie_, &resp_res_args);
+    ASSERT_EQ(ret, 0);
+
+    // Send INIT command
+    struct amdxdna_ccmd_init_req init_cmd = {};
+    init_cmd.hdr.cmd = AMDXDNA_CCMD_INIT;
+    init_cmd.hdr.len = sizeof(init_cmd);
+    init_cmd.rsp_res_id = 100;
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, &init_cmd, sizeof(init_cmd));
+    EXPECT_EQ(ret, 0);
+
+    // Send READ_SYSFS command for a commonly available node
+    alignas(struct amdxdna_ccmd_read_sysfs_req) char cmd_buf[128];
+    auto *read_sysfs_cmd = reinterpret_cast<struct amdxdna_ccmd_read_sysfs_req*>(cmd_buf);
+    read_sysfs_cmd->hdr.cmd = AMDXDNA_CCMD_READ_SYSFS;
+    const char *node_name = "uevent"; // Common sysfs node
+    read_sysfs_cmd->hdr.len = sizeof(struct amdxdna_ccmd_read_sysfs_req) + strlen(node_name) + 1;
+    read_sysfs_cmd->hdr.rsp_off = 0;
+    strcpy(read_sysfs_cmd->node_name, node_name);
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, read_sysfs_cmd, read_sysfs_cmd->hdr.len);
+    // This may succeed or fail depending on the actual device
+    // The test verifies the command is properly dispatched
+    if (ret == 0) {
+        // Verify response structure
+        auto *rsp = reinterpret_cast<struct amdxdna_ccmd_read_sysfs_rsp*>(resp_buf.data());
+        EXPECT_GT(rsp->hdr.base.len, sizeof(struct amdxdna_ccmd_read_sysfs_rsp))
+            << "Response should contain data";
+        EXPECT_GT(rsp->val_len, 0) << "Should have read some data";
+    }
+}
+
+TEST_F(VaccelRendererTest, SubmitCcmdReadSysfsInvalidNode) {
+    if (drm_fd_ < 0) {
+        GTEST_SKIP() << "No DRM device available";
+    }
+
+    // Create device and context
+    int ret = createTestDevice(VIRACCEL_CAPSET_ID_AMDXDNA);
+    ASSERT_EQ(ret, 0);
+
+    uint32_t ctx_id = 1;
+    ret = vaccel_create_ctx_with_flags(cookie_, ctx_id, 0, 0, nullptr);
+    ASSERT_EQ(ret, 0);
+
+    // Create response resource
+    std::vector<uint8_t> resp_buf(4096);
+    struct vaccel_iovec resp_iov = {
+        .iov_base = resp_buf.data(),
+        .iov_len = resp_buf.size()
+    };
+
+    struct vaccel_create_resource_blob_args resp_res_args = {};
+    resp_res_args.res_handle = 100;
+    resp_res_args.size = resp_buf.size();
+    resp_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    resp_res_args.iovecs = &resp_iov;
+    resp_res_args.num_iovs = 1;
+
+    ret = vaccel_create_resource_blob(cookie_, &resp_res_args);
+    ASSERT_EQ(ret, 0);
+
+    // Send INIT command
+    struct amdxdna_ccmd_init_req init_cmd = {};
+    init_cmd.hdr.cmd = AMDXDNA_CCMD_INIT;
+    init_cmd.hdr.len = sizeof(init_cmd);
+    init_cmd.rsp_res_id = 100;
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, &init_cmd, sizeof(init_cmd));
+    EXPECT_EQ(ret, 0);
+
+    // Send READ_SYSFS command for non-existent node
+    alignas(struct amdxdna_ccmd_read_sysfs_req) char cmd_buf[128];
+    auto *read_sysfs_cmd = reinterpret_cast<struct amdxdna_ccmd_read_sysfs_req*>(cmd_buf);
+    read_sysfs_cmd->hdr.cmd = AMDXDNA_CCMD_READ_SYSFS;
+    const char *node_name = "nonexistent_node_12345";
+    read_sysfs_cmd->hdr.len = sizeof(struct amdxdna_ccmd_read_sysfs_req) + strlen(node_name) + 1;
+    read_sysfs_cmd->hdr.rsp_off = 0;
+    strcpy(read_sysfs_cmd->node_name, node_name);
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, read_sysfs_cmd, read_sysfs_cmd->hdr.len);
+    EXPECT_LT(ret, 0) << "Should fail with non-existent sysfs node";
+}
+
+TEST_F(VaccelRendererTest, SubmitCcmdReadSysfsEmptyNodeName) {
+    if (drm_fd_ < 0) {
+        GTEST_SKIP() << "No DRM device available";
+    }
+
+    // Create device and context
+    int ret = createTestDevice(VIRACCEL_CAPSET_ID_AMDXDNA);
+    ASSERT_EQ(ret, 0);
+
+    uint32_t ctx_id = 1;
+    ret = vaccel_create_ctx_with_flags(cookie_, ctx_id, 0, 0, nullptr);
+    ASSERT_EQ(ret, 0);
+
+    // Create response resource
+    std::vector<uint8_t> resp_buf(4096);
+    struct vaccel_iovec resp_iov = {
+        .iov_base = resp_buf.data(),
+        .iov_len = resp_buf.size()
+    };
+
+    struct vaccel_create_resource_blob_args resp_res_args = {};
+    resp_res_args.res_handle = 100;
+    resp_res_args.size = resp_buf.size();
+    resp_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    resp_res_args.iovecs = &resp_iov;
+    resp_res_args.num_iovs = 1;
+
+    ret = vaccel_create_resource_blob(cookie_, &resp_res_args);
+    ASSERT_EQ(ret, 0);
+
+    // Send INIT command
+    struct amdxdna_ccmd_init_req init_cmd = {};
+    init_cmd.hdr.cmd = AMDXDNA_CCMD_INIT;
+    init_cmd.hdr.len = sizeof(init_cmd);
+    init_cmd.rsp_res_id = 100;
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, &init_cmd, sizeof(init_cmd));
+    EXPECT_EQ(ret, 0);
+
+    // Send READ_SYSFS command with empty node name
+    alignas(struct amdxdna_ccmd_read_sysfs_req) char cmd_buf[128];
+    auto *read_sysfs_cmd = reinterpret_cast<struct amdxdna_ccmd_read_sysfs_req*>(cmd_buf);
+    read_sysfs_cmd->hdr.cmd = AMDXDNA_CCMD_READ_SYSFS;
+    read_sysfs_cmd->hdr.len = sizeof(struct amdxdna_ccmd_read_sysfs_req) + 1;
+    read_sysfs_cmd->hdr.rsp_off = 0;
+    read_sysfs_cmd->node_name[0] = '\0';
+
+    ret = vaccel_submit_ccmd(cookie_, ctx_id, read_sysfs_cmd, read_sysfs_cmd->hdr.len);
+    EXPECT_LT(ret, 0) << "Should fail with empty node name";
+}
+
+// =============================================================================
 // Integration Test
 // =============================================================================
 
