@@ -1001,7 +1001,8 @@ int aie2_cmd_submit(struct amdxdna_ctx *ctx, struct amdxdna_sched_job *job,
 		goto rq_yield;
 	}
 
-#if KERNEL_VERSION(6, 17, 0) <= LINUX_VERSION_CODE
+//#if KERNEL_VERSION(6, 17, 0) <= LINUX_VERSION_CODE
+#if 1
 	ret = drm_sched_job_init(&job->base, &ctx->priv->entity, 1, ctx,
 				 ctx->client->filp->client_id);
 #else
