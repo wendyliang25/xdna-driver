@@ -394,7 +394,7 @@ TEST_F(VaccelRendererTest, FillCapsetVerifyStructure) {
               << ", version_minor=" << capset.version_minor
               << ", version_patchlevel=" << capset.version_patchlevel
               << ", context_type=" << capset.context_type
-              << ", pad=" << capset.pad << std::endl;
+              << ", use_hostmem=" << capset.use_hostmem << std::endl;
 }
 
 // =============================================================================
@@ -1307,7 +1307,7 @@ TEST_F(VaccelRendererTest, FullWorkflow) {
     EXPECT_GT(capset->version_major, 0);
     EXPECT_LE(capset->version_minor, capset->version_major);
     EXPECT_EQ(capset->context_type, VIRTACCEL_DRM_CONTEXT_AMDXDNA);
-    EXPECT_EQ(capset->pad, 0);
+    EXPECT_EQ(capset->use_hostmem, 0);
 
     // 5. Destroy device
     destroyTestDevice();

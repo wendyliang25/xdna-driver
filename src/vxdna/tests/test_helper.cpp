@@ -102,6 +102,7 @@ void VaccelRendererTestBase::SetUp() {
     
     // Set up callbacks
     callbacks_.get_device_fd = getDeviceFdCallback;
+    callbacks_.use_host_memory = useHostMemoryCallback;
 }
 
 void VaccelRendererTestBase::TearDown() {
@@ -124,6 +125,11 @@ int VaccelRendererTestBase::getDeviceFdCallback(void *cookie) {
     }
     int *fd_ptr = static_cast<int*>(cookie);
     return *fd_ptr;
+}
+
+bool VaccelRendererTestBase::useHostMemoryCallback(void *cookie) {
+    (void)cookie;
+    return false;
 }
 
 int VaccelRendererTestBase::createTestDevice(uint32_t capset_id) {
