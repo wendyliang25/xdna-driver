@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <sstream>
 #include <stdlib.h>
@@ -22,7 +23,6 @@
 #include <sys/sysmacros.h>
 #include <errno.h>
 #include <vector>
-#include <type_traits>
 
 #include <drm/drm.h>
 #include <sys/mman.h>
@@ -73,7 +73,6 @@ vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
          const struct amdxdna_ccmd_create_bo_req *req)
 {
     struct amdxdna_drm_get_bo_info bo_info = {};
-    struct amdxdna_drm_create_bo args = {};
     int ret;
 
     ctx_fd = ctx_fd_in;
@@ -94,14 +93,19 @@ vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
         tbl->va_entries[i].len = static_cast<uint64_t>(iovecs[i].iov_len);
         map_size += tbl->va_entries[i].len;
     }
-    args.vaddr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buf_vec.data()));
-    args.size = size;
-    args.type = bo_type;
-    ret = ioctl(ctx_fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &args);
-    if (ret)
-        VACCEL_THROW_MSG(-errno, "Create bo failed ret %d, errno %d, %s", ret, -errno, strerror(errno));
+    if (res->get_opaque_handle() < 0) {
+        struct amdxdna_drm_create_bo args = {};
+        args.vaddr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buf_vec.data()));
+        args.size = size;
+        args.type = bo_type;
+        ret = ioctl(ctx_fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &args);
+        if (ret)
+            VACCEL_THROW_MSG(-errno, "Create bo failed ret %d, errno %d, %s", ret, -errno, strerror(errno));
+        bo_handle = args.handle;
+    } else {
+        bo_handle = res->get_opaque_handle();
+    }
 
-    bo_handle = args.handle;
     bo_info.handle = bo_handle;
     ret = ioctl(ctx_fd, DRM_IOCTL_AMDXDNA_GET_BO_INFO, &bo_info);
     if (ret)
@@ -110,6 +114,11 @@ vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
     map_offset = bo_info.map_offset;
     xdna_addr = bo_info.xdna_addr;
     vaddr = bo_info.vaddr;
+
+    if (xdna_addr != AMDXDNA_INVALID_ADDR) {
+        vxdna_dbg("BO already mapped: handle=%u, xdna_addr=%lu", bo_handle, xdna_addr);
+        return;
+    }
 
     // mmap is required for non-dev BOs
     uint64_t resv_vaddr = 0, resv_size = 0, va_to_map = 0;
@@ -131,13 +140,13 @@ vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
 
     if (va == MAP_FAILED) {
         if (resv_va && resv_va != MAP_FAILED)
-            munmap(resv_va, resv_size);
+            ::munmap(resv_va, resv_size);
         VACCEL_THROW_MSG(-EFAULT, "Map bo failed");
     }
     vaddr = reinterpret_cast<uint64_t>(va);
 
     if (req->map_align && vaddr > resv_vaddr)
-        munmap(resv_va, static_cast<size_t>(vaddr - resv_vaddr));
+        ::munmap(resv_va, static_cast<size_t>(vaddr - resv_vaddr));
     if (resv_vaddr + resv_size > vaddr + map_size)
         munmap((void *)(vaddr + map_size),
                (size_t)(resv_vaddr + resv_size - vaddr - map_size));
@@ -360,6 +369,22 @@ remove_bo(uint32_t handle)
     bo_table.erase(handle);
 }
 
+int
+vxdna_context::
+export_resource_fd(const std::shared_ptr<vaccel_resource> &res)
+{
+    if (res->get_opaque_handle() < 0)
+        VACCEL_THROW_MSG(-EINVAL, "Resource is not opaque");
+    struct drm_prime_handle args;
+    args.handle = res->get_opaque_handle();
+    args.flags = DRM_RDWR | DRM_CLOEXEC;
+    args.fd = -1;
+    auto ret = ioctl(get_fd(), DRM_IOCTL_PRIME_HANDLE_TO_FD, &args);
+    if (ret)
+        VACCEL_THROW_MSG(-errno, "Export resource fd failed ret %d, errno %d, %s", ret, errno, strerror(errno));
+    return args.fd;
+}
+
 void
 vxdna_context::
 create_hwctx(const struct amdxdna_ccmd_create_ctx_req *req)
@@ -547,6 +572,25 @@ write_rsp(const void *rsp, size_t rsp_size, uint32_t rsp_off)
     resp_res->write(rsp_off, rsp, rsp_size);
 }
 
+int
+vxdna_context::
+get_blob(const struct vaccel_create_resource_blob_args *args)
+{
+    vxdna_dbg("Getting blob: ctx_id=%u, blob_id=%ld, blob_size=%zu", get_id(), args->blob_id, args->size);
+    struct amdxdna_drm_create_bo blob_args = {};
+    blob_args.type = args->blob_id;//AMDXDNA_BO_SHMEM;
+    blob_args.size = args->size;
+    auto ret = ioctl(get_fd(), DRM_IOCTL_AMDXDNA_CREATE_BO, &blob_args);
+    if (ret) {
+        VACCEL_THROW_MSG(-errno, "Create blob failed ret %d, %d, %s, type %d, size %lld\n",
+                         ret, -errno, strerror(errno), (uint32_t)blob_args.type, blob_args.size);
+    }
+
+    return blob_args.handle;
+}
+
+
+
 void
 vxdna::
 get_capset_info(uint32_t *max_version, uint32_t *max_size)
@@ -570,6 +614,11 @@ fill_capset(uint32_t capset_size, void *capset_buf)
 
     /* Copy the capset structure to user buffer */
     memcpy(capset_buf, &vxdna::capset, sizeof(vxdna::capset));
+    auto use_hostmem = get_callbacks()->use_host_memory(get_cookie());
+    if (use_hostmem) {
+        struct vaccel_drm_capset *capset_p = static_cast<struct vaccel_drm_capset *>(capset_buf);
+        capset_p->use_hostmem = 1;
+    }
     vxdna_dbg("Capset structure filled for capset_id=%u, version=%u",
                get_capset_id(), vxdna::capset.version_major);
 }
@@ -601,6 +650,20 @@ destroy_ctx(uint32_t ctx_id)
 {
     vxdna_dbg("Destroying execution ctx: ctx_id=%u", ctx_id);
     remove_ctx(ctx_id);
+}
+
+
+void
+vxdna::
+create_resource_from_blob(const struct vaccel_create_resource_blob_args *args)
+{
+    auto ctx = get_ctx(args->ctx_id);
+    if (!ctx)
+        VACCEL_THROW_MSG(-EINVAL, "Context not found");
+    int opaque_handle = ctx->get_blob(args);
+    auto res = std::make_shared<vaccel_resource>(args->res_handle, args->size,
+                                                 opaque_handle, args->ctx_id);
+    add_resource(args->res_handle, std::move(res));
 }
 
 void

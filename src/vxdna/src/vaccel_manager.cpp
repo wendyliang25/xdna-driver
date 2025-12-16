@@ -23,6 +23,20 @@
 
 #include "vaccel_amdxdna.h"
 
+void *
+vaccel_resource::
+mmap(int fd)
+{
+    if (map_addr)
+        VACCEL_THROW_MSG(-EINVAL, "Resource already mapped");
+    map_addr = ::mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map_addr == MAP_FAILED)
+        VACCEL_THROW_MSG(-errno, "Failed to mmap resource: errno %d, %s", errno, strerror(errno));
+    map_info = 1; // TODO:Used by linux kernel virtio-gpu driver vram, to set pgprot for mapping
+                  // 1 is for CACHED
+    return map_addr;
+}
+
 /* Global device table: cookie -> shared_ptr<vaccel> */
 static vaccel_map<void*, std::shared_ptr<vxdna>> device_table;
 
@@ -91,9 +105,6 @@ _vaccel_create_resource_blob(void *cookie, const struct vaccel_create_resource_b
     if (!device)
         VACCEL_THROW_MSG(-ENODEV, "Device not found for cookie %p", cookie);
 
-    if (args->blob_mem != VACCEL_BLOB_MEM_GUEST)
-        VACCEL_THROW_MSG(-EINVAL, "Unsupported blob memory type: %u", args->blob_mem);
-
     /* user resource id must be greater than 0 */
     if (args->res_handle == 0)
         VACCEL_THROW_MSG(-EINVAL, "Resource handle must be greater than 0");
@@ -103,11 +114,57 @@ _vaccel_create_resource_blob(void *cookie, const struct vaccel_create_resource_b
 
     if (args->size == 0)
         VACCEL_THROW_MSG(-EINVAL, "Resource blob size must be greater than 0, size=%zu", args->size);
-    const size_t iov_size = _vaccel_get_iovec_size(args->iovecs, args->num_iovs);
-    if (iov_size < args->size)
-        VACCEL_THROW_MSG(-EINVAL, "IO vector size is less than the blob size");
 
-    device->create_resource(args);
+    if (args->blob_mem == VACCEL_BLOB_MEM_GUEST) {
+        const size_t iov_size = _vaccel_get_iovec_size(args->iovecs, args->num_iovs);
+        if (iov_size < args->size)
+            VACCEL_THROW_MSG(-EINVAL, "IO vector size is less than the blob size");
+    
+        device->create_resource(args);
+    } else if (args->blob_mem == VACCEL_BLOB_MEM_HOST) {
+        device->create_resource_from_blob(args);
+    } else {
+        VACCEL_THROW_MSG(-EINVAL, "Unsupported blob memory type: %u", args->blob_mem);
+    }
+}
+
+static void
+_vaccel_resource_map(void *cookie, uint32_t res_id, void** data, size_t* size)
+{
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+    auto device = vaccel_lookup(cookie);
+    if (!device)
+        VACCEL_THROW_MSG(-ENODEV, "Device not found for cookie %p", cookie);
+    auto fd = device->export_resource_fd(res_id);
+    if (fd < 0)
+        VACCEL_THROW_MSG(-EINVAL, "Export resource fd failed ret %d, errno %d, %s", fd, errno, strerror(errno));
+    auto res = device->get_resource(res_id);
+    if (!res) {
+        close(fd);
+        VACCEL_THROW_MSG(-ENOENT, "Resource handle %u not found", res_id);
+    }
+    *data = res->mmap(fd);
+    *size = res->get_size();
+    close(fd);
+}
+
+static void
+_vaccel_resource_unmap(void *cookie, uint32_t res_id)
+{
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+    auto device = vaccel_lookup(cookie);
+    device->get_resource(res_id)->munmap();
+}
+
+static void
+_vaccel_resource_get_map_info(void *cookie, uint32_t res_id, uint32_t &map_info)
+{
+    if (!cookie)
+        VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
+    auto device = vaccel_lookup(cookie);
+    map_info = device->get_resource(res_id)->get_map_info();
 }
 
 static void
@@ -331,6 +388,27 @@ vaccel_create_resource_blob(void *cookie, const struct vaccel_create_resource_bl
 {
     return vaccel_error_wrap("vaccel_create_resource_blob", [&]() {
         _vaccel_create_resource_blob(cookie, args);
+    });
+}
+
+int vaccel_resource_map(void *cookie, uint32_t res_id, void** data, size_t* size)
+{
+    return vaccel_error_wrap("vaccel_resource_map", [&]()-> void {
+        _vaccel_resource_map(cookie, res_id, data, size);
+    });
+}
+
+int vaccel_resource_unmap(void *cookie, uint32_t res_id)
+{
+    return vaccel_error_wrap("vaccel_resource_unmap", [&]() -> void {
+        _vaccel_resource_unmap(cookie, res_id);
+    });
+}   
+
+int vaccel_resource_get_map_info(void *cookie, uint32_t res_id, uint32_t &map_info)
+{
+    return vaccel_error_wrap("vaccel_resource_get_map_info", [&]() {
+        _vaccel_resource_get_map_info(cookie, res_id, map_info);
     });
 }
 

@@ -37,7 +37,6 @@ class vxdna_bo {
         vxdna_bo(vxdna_bo&&) = delete;
         vxdna_bo& operator=(vxdna_bo&&) = delete;
 
-        void *mmap(size_t map_aligned);
         uint64_t get_addr() const noexcept
         {
             if (xdna_addr != AMDXDNA_INVALID_ADDR)
@@ -85,6 +84,7 @@ public:
     {
         return resp_res;
     }
+    int export_resource_fd(const std::shared_ptr<vaccel_resource> &res);
 
     void create_bo(const vxdna &device, const struct amdxdna_ccmd_create_bo_req *req);
     void add_bo(std::shared_ptr<vxdna_bo> &&bo);
@@ -107,6 +107,7 @@ public:
     {
         return cookie;
     }
+    int get_blob(const struct vaccel_create_resource_blob_args *args);
 private:
     class vxdna_hwctx {
     public:
@@ -185,6 +186,7 @@ public:
     void fill_capset(uint32_t capset_size, void *capset_buf);
     void create_ctx(uint32_t ctx_id, uint32_t ctx_flags, uint32_t nlen, const char *name);
     void destroy_ctx(uint32_t ctx_id);
+    void create_resource_from_blob(const struct vaccel_create_resource_blob_args *args);
     void destroy_resource(const std::shared_ptr<vaccel_resource> &res);
     void context_submit_ccmd(const std::shared_ptr<vxdna_context> &ctx, const void *ccmd, uint32_t ccmd_size);
     void submit_fence(uint32_t ctx_id, uint32_t flags, uint32_t ring_idx, uint64_t fence_id);
@@ -196,7 +198,7 @@ private:
         .version_minor = 0,
         .version_patchlevel = 0,
         .context_type = VIRTACCEL_DRM_CONTEXT_AMDXDNA,
-        .pad = 0,
+        .use_hostmem = 0,
     };
 };
 

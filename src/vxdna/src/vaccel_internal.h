@@ -94,8 +94,9 @@ public:
         return _map.find(key) != _map.end();
     }
 
-    // Optional: Map size
+    // Optional: Map size (thread-safe)
     size_t size() const {
+        std::lock_guard<std::mutex> lock(_mtx);
         return _map.size();
     }
 
@@ -113,22 +114,34 @@ private:
 class vaccel_resource {
 public:
     vaccel_resource(uint32_t res_id_in, uint64_t size_in, uint32_t flags_in,
-        const struct vaccel_iovec *iovecs_in, uint32_t num_iovecs_in)
+        const struct vaccel_iovec *iovecs_in, uint32_t num_iovecs_in, uint32_t ctx_id_in)
         : res_id(res_id_in)
         , size(size_in)
         , flags(flags_in)
-        , fd(-1)
         , map_addr(NULL)
+        , map_info(0)
         , iovecs(iovecs_in)
         , num_iovecs(num_iovecs_in)
+        , ctx_id(ctx_id_in)
+        , opaque_handle(-1)
+
+    {}
+
+    vaccel_resource(uint32_t res_id_in, uint64_t size_in, int opaque_handle_in, uint32_t ctx_id_in)
+    : res_id(res_id_in)
+    , size(size_in)
+    , flags(0)
+    , map_addr(NULL)
+    , map_info(0)
+    , iovecs(NULL)
+    , num_iovecs(0)
+    , ctx_id(ctx_id_in)
+    , opaque_handle(opaque_handle_in)
     {}
 
     ~vaccel_resource()
     {
-        if (fd >= 0)
-            close(fd);
-        if (map_addr)
-            munmap(map_addr, size);
+        munmap();
     }
 
     uint32_t
@@ -147,12 +160,6 @@ public:
     get_flags() const noexcept
     {
         return flags;
-    }
-
-    int
-    get_fd() const noexcept
-    {
-        return fd;
     }
 
     void *
@@ -226,14 +233,44 @@ public:
         return num_iovecs;
     }
 
+    uint32_t
+    get_ctx_id() const noexcept
+    {
+        return ctx_id;
+    }
+
+    int
+    get_opaque_handle() const noexcept
+    {
+        return opaque_handle;
+    }
+
+    uint32_t
+    get_map_info() const noexcept
+    {
+        return map_info;
+    }
+
+    void *
+    mmap(int fd);
+
+    void
+    munmap()
+    {
+        if (map_addr)
+            ::munmap(map_addr, size);
+        map_addr = NULL;
+    }
 private:
     uint32_t res_id;           /**< Resource ID (unique per device) */
     uint64_t size;             /**< Resource size in bytes */
     uint32_t flags;            /**< Resource creation flags */
-    int fd;                    /**< DMA-BUF FD or -1 if not exported */
     void *map_addr;            /**< Mapped address (NULL if not mapped) */
+    uint32_t map_info;         /**< Map information */
     const struct vaccel_iovec *iovecs; /**< IO vectors */
     uint32_t num_iovecs; /**< Number of IO vectors */
+    uint32_t ctx_id; /**< Context ID */
+    int opaque_handle; /**< Opaque handle */
 };
 
 /**
@@ -267,6 +304,12 @@ public:
     get_ccmd_align() const noexcept
     {
         return ccmd_align;
+    }
+
+    int
+    get_blob(const struct vaccel_create_resource_blob_args *args)
+    {
+        return static_cast<ContextType*>(this)->get_blob(args);
     }
 
 private:
@@ -376,11 +419,11 @@ public:
         }
     }
 
-    // Disable copy and move
+    // Disable copy and move (contains non-copyable/non-movable members)
     vaccel(const vaccel&) = delete;
-    vaccel& operator=(const vaccel&) = default;
-    vaccel(vaccel&&) = default;
-    vaccel& operator=(vaccel&&) = default;
+    vaccel& operator=(const vaccel&) = delete;
+    vaccel(vaccel&&) = delete;
+    vaccel& operator=(vaccel&&) = delete;
 
     void
     get_capset_info(uint32_t *max_version, uint32_t *max_size)
@@ -444,8 +487,16 @@ public:
     void
     create_resource(const struct vaccel_create_resource_blob_args *args)
     {
-        auto res = std::make_shared<vaccel_resource>(args->res_handle, args->size, args->blob_flags, args->iovecs, args->num_iovs);
+        auto res = std::make_shared<vaccel_resource>(args->res_handle, args->size,
+                                                     args->blob_flags, args->iovecs,
+                                                     args->num_iovs, args->ctx_id);
         add_resource(args->res_handle, std::move(res));
+    }
+
+    void
+    create_resource_from_blob(const struct vaccel_create_resource_blob_args *args)
+    {
+        static_cast<T*>(this)->create_resource_from_blob(args);
     }
 
     void
@@ -456,6 +507,21 @@ public:
             VACCEL_THROW_MSG(-ENOENT, "Resource not found: res_id=%u", res_id);
         static_cast<T*>(this)->destroy_resource(res);
         resource_table.erase(res_id);
+    }
+
+    int
+    export_resource_fd(uint32_t res_id)
+    {
+        auto res = get_resource(res_id);
+        if (!res)
+            VACCEL_THROW_MSG(-ENOENT, "Resource not found: res_id=%u", res_id);
+        if (res->get_opaque_handle() < 0)
+            VACCEL_THROW_MSG(-EINVAL, "Resource is not opaque");
+        auto ctx_id = res->get_ctx_id();
+        auto ctx = get_ctx(ctx_id);
+        if (!ctx)
+            VACCEL_THROW_MSG(-ENOENT, "Context not found: ctx_id=%u", ctx_id);
+        return static_cast<ContextType*>(ctx.get())->export_resource_fd(res);
     }
 
     int
@@ -520,7 +586,6 @@ public:
     {
         return callbacks;
     }
-
 private:
     // Public members for C API compatibility
     void *cookie;              /**< Device cookie (e.g., DRM FD) */
