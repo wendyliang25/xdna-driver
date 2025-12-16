@@ -17,21 +17,11 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <drm/virtgpu_drm.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/**
- * @brief Resource blob memory type enumeration
- *
- * Specifies the memory location for backing blob resources.
- * enum values referers to virglrenderer blob memory type
- */
-enum vaccel_blob_mem_type {
-    VACCEL_BLOB_MEM_GUEST = 0,   /**< Blob memory in guest-allocated memory */
-    VACCEL_BLOB_MEM_MAX = 1,     /**< Maximum supported blob mem type (sentinel) */
-};
 
 /**
  * @brief IO vector structure
@@ -75,22 +65,6 @@ enum virtaccel_context_type {
 };
 
 /**
- * @brief DRM capset structure
- *
- * Contains capability set information including version range
- * and context type.
- */
- struct vaccel_drm_capset {
-    uint32_t wire_format_version;
-    /* Underlying drm device version: */
-    uint32_t version_major;
-    uint32_t version_minor;
-    uint32_t version_patchlevel;
-    uint32_t context_type;
-    uint32_t pad;
- };
-
-/**
  * @brief Callback functions structure
  *
  * User-provided callback functions for vaccel operations.
@@ -127,6 +101,18 @@ struct vaccel_callbacks {
      * @param fence_id Fence ID to write
      */
     void (*write_context_fence)(void *cookie, uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id);
+
+    /**
+     * @brief Check if host memory is used for shared memory
+     *
+     * This callback allows the renderer to query if host memory
+     * should be used for shared memory (for example, for efficient
+     * guest-host buffer sharing or zero-copy).
+     *
+     * @param cookie Device cookie
+     * @return true if host memory is used, false otherwise
+     */
+    bool (*use_host_memory)(void *cookie);
 };
 
 /**
@@ -298,6 +284,42 @@ int vaccel_detach_destroy_resource_blob(void *cookie, uint32_t res_handle,
  * @return 0 on success, negative errno on failure
  */
 int vaccel_submit_ccmd(void *cookie, uint32_t ctx_id, const void *ccmd, uint32_t ccmd_size);
+
+/**
+ * @brief Map a resource blob to host memory
+ *
+ * Maps a resource blob to host memory.
+ *
+ * @param cookie Device cookie
+ * @param res_id Resource handle to map
+ * @param[out] data Pointer to receive the mapped memory address
+ * @param[out] size Pointer to receive the mapped memory size
+ * @return 0 on success, negative errno on failure
+ */
+int vaccel_resource_map(void *cookie, uint32_t res_id, void** data, size_t* size);
+
+/**
+ * @brief Unmap a resource blob from host memory
+ *
+ * Unmaps a resource blob from host memory.
+ *
+ * @param cookie Device cookie
+ * @param res_id Resource handle to unmap
+ * @return 0 on success, negative errno on failure
+ */
+int vaccel_resource_unmap(void *cookie, uint32_t res_id);
+
+/**
+ * @brief Get map information for a resource blob
+ *
+ * Gets map information for a resource blob.
+ *
+ * @param cookie Device cookie
+ * @param res_id Resource handle to get map information for
+ * @param[out] map_info Pointer to receive the map information
+ * @return 0 on success, negative errno on failure
+ */
+int vaccel_resource_get_map_info(void *cookie, uint32_t res_id, uint32_t *map_info);
 
 #ifdef __cplusplus
 }

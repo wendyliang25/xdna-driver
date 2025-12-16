@@ -115,13 +115,13 @@ _vaccel_create_resource_blob(void *cookie, const struct vaccel_create_resource_b
     if (args->size == 0)
         VACCEL_THROW_MSG(-EINVAL, "Resource blob size must be greater than 0, size=%zu", args->size);
 
-    if (args->blob_mem == VACCEL_BLOB_MEM_GUEST) {
+    if (args->blob_mem == VIRTGPU_BLOB_MEM_GUEST) {
         const size_t iov_size = _vaccel_get_iovec_size(args->iovecs, args->num_iovs);
         if (iov_size < args->size)
             VACCEL_THROW_MSG(-EINVAL, "IO vector size is less than the blob size");
     
         device->create_resource(args);
-    } else if (args->blob_mem == VACCEL_BLOB_MEM_HOST) {
+    } else if (args->blob_mem == VIRTGPU_BLOB_MEM_HOST3D) {
         device->create_resource_from_blob(args);
     } else {
         VACCEL_THROW_MSG(-EINVAL, "Unsupported blob memory type: %u", args->blob_mem);
@@ -159,12 +159,16 @@ _vaccel_resource_unmap(void *cookie, uint32_t res_id)
 }
 
 static void
-_vaccel_resource_get_map_info(void *cookie, uint32_t res_id, uint32_t &map_info)
+_vaccel_resource_get_map_info(void *cookie, uint32_t res_id, uint32_t *map_info)
 {
+    if (!map_info)
+        VACCEL_THROW_MSG(-EINVAL, "Map info is nullptr");
     if (!cookie)
         VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
     auto device = vaccel_lookup(cookie);
-    map_info = device->get_resource(res_id)->get_map_info();
+    if (!device)
+        VACCEL_THROW_MSG(-ENODEV, "Device not found for cookie %p", cookie);
+    *map_info = device->get_resource(res_id)->get_map_info();
 }
 
 static void
@@ -405,7 +409,7 @@ int vaccel_resource_unmap(void *cookie, uint32_t res_id)
     });
 }   
 
-int vaccel_resource_get_map_info(void *cookie, uint32_t res_id, uint32_t &map_info)
+int vaccel_resource_get_map_info(void *cookie, uint32_t res_id, uint32_t *map_info)
 {
     return vaccel_error_wrap("vaccel_resource_get_map_info", [&]() {
         _vaccel_resource_get_map_info(cookie, res_id, map_info);

@@ -52,6 +52,7 @@ vxdna_bo(int ctx_fd_in, const struct amdxdna_ccmd_create_bo_req *req)
     xdna_addr = AMDXDNA_INVALID_ADDR;
     args.size = size;
     args.type = bo_type;
+    vxdna_dbg("Create bo: ctx_fd=%d, type=%d, size=%lu", ctx_fd, bo_type, size);
     ret = ioctl(ctx_fd, DRM_IOCTL_AMDXDNA_CREATE_BO, &args);
     if (ret)
         VACCEL_THROW_MSG(-errno, "Create bo failed ret %d", ret);
@@ -65,7 +66,7 @@ vxdna_bo(int ctx_fd_in, const struct amdxdna_ccmd_create_bo_req *req)
     map_offset = bo_info.map_offset;
     xdna_addr = bo_info.xdna_addr;
     vaddr = bo_info.vaddr;
-    vxdna_dbg("Created bo: handle=%u, xdna_addr=%lu", bo_handle, xdna_addr);
+    vxdna_dbg("Created bo: ctx_fd=%d, handle=%u, xdna_addr=%lu", ctx_fd, bo_handle, xdna_addr);
 }
 
 vxdna_bo::
@@ -115,8 +116,8 @@ vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
     xdna_addr = bo_info.xdna_addr;
     vaddr = bo_info.vaddr;
 
-    if (xdna_addr != AMDXDNA_INVALID_ADDR) {
-        vxdna_dbg("BO already mapped: handle=%u, xdna_addr=%lu", bo_handle, xdna_addr);
+    if (vaddr != AMDXDNA_INVALID_ADDR) {
+        vxdna_dbg("BO already mapped: handle=%u, xdna_addr=%lx, vaddr=%lx", bo_handle, xdna_addr, vaddr);
         return;
     }
 
@@ -150,18 +151,19 @@ vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
     if (resv_vaddr + resv_size > vaddr + map_size)
         munmap((void *)(vaddr + map_size),
                (size_t)(resv_vaddr + resv_size - vaddr - map_size));
-    vxdna_dbg("%s, %u with resource: type=%u, res_id=%u, num_iovs=%u", __func__, __LINE__, req->bo_type, req->res_id, num_iovs);
+    vxdna_dbg("Created BO with resource: type=%u, res_id=%u, num_iovs=%u", req->bo_type, req->res_id, num_iovs);
 }
 
 vxdna_bo::
 ~vxdna_bo()
 {
-    vxdna_dbg("Destroying bo: handle=%u, vaddr=%lu, map_size=%lu", bo_handle, vaddr, map_size);
+    vxdna_dbg("Destroying bo: ctx_fd=%d, handle=%u, vaddr=%lx, map_size=%lu", ctx_fd, bo_handle, vaddr, map_size);
     if (vaddr != AMDXDNA_INVALID_ADDR)
         munmap(reinterpret_cast<void *>(vaddr), static_cast<size_t>(map_size));
     if (bo_handle != AMDXDNA_INVALID_BO_HANDLE) {
         struct drm_gem_close arg = {};
         arg.handle = bo_handle;
+        vxdna_dbg("Close bo: ctx_fd=%d, handle=%u", ctx_fd, bo_handle);
         auto ret = ioctl(ctx_fd, DRM_IOCTL_GEM_CLOSE, &arg);
         if (ret)
             vxdna_err("Close vxdna bo failed ret %d", ret);
@@ -204,7 +206,6 @@ vxdna_hwctx(const vxdna_context &ctx,
     args.num_tiles = req->num_tiles;
     args.mem_size = req->mem_size;
     args.qos_p = (uint64_t)&req->qos_info;
-
     int ret = ioctl(ctx.get_fd(), DRM_IOCTL_AMDXDNA_CREATE_HWCTX, &args);
     if (ret)
         VACCEL_THROW_MSG(-errno, "Create hw context failed ret %d, errno %d, %s", ret, errno, strerror(errno));
@@ -218,6 +219,7 @@ vxdna_hwctx(const vxdna_context &ctx,
     if (!write_fence_callback)
         VACCEL_THROW_MSG(-EINVAL, "Write fence callback not found");
 
+    vxdna_dbg("Create hw context: ctx_fd=%d, max_opc=%u, num_tiles=%u, mem_size=%u", ctx_fd, req->max_opc, req->num_tiles, req->mem_size);
     cookie = ctx.get_cookie();
     ctx_id = ctx.get_id();
 
@@ -576,7 +578,7 @@ int
 vxdna_context::
 get_blob(const struct vaccel_create_resource_blob_args *args)
 {
-    vxdna_dbg("Getting blob: ctx_id=%u, blob_id=%ld, blob_size=%zu", get_id(), args->blob_id, args->size);
+    vxdna_dbg("Getting blob: ctx_id=%u, ctx_fd=%d, blob_id=%ld, blob_size=%zu", get_id(), get_fd(), args->blob_id, args->size);
     struct amdxdna_drm_create_bo blob_args = {};
     blob_args.type = args->blob_id;//AMDXDNA_BO_SHMEM;
     blob_args.size = args->size;
@@ -588,8 +590,6 @@ get_blob(const struct vaccel_create_resource_blob_args *args)
 
     return blob_args.handle;
 }
-
-
 
 void
 vxdna::
@@ -659,7 +659,7 @@ create_resource_from_blob(const struct vaccel_create_resource_blob_args *args)
 {
     auto ctx = get_ctx(args->ctx_id);
     if (!ctx)
-        VACCEL_THROW_MSG(-EINVAL, "Context not found");
+        VACCEL_THROW_MSG(-EINVAL, "Context not found, ctx_id %u", args->ctx_id);
     int opaque_handle = ctx->get_blob(args);
     auto res = std::make_shared<vaccel_resource>(args->res_handle, args->size,
                                                  opaque_handle, args->ctx_id);
