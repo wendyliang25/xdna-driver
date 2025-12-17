@@ -24,11 +24,11 @@
 #include "amdxdna_devel.h"
 #endif
 
-#ifdef HAVE_6_13_MODULE_IMPORT_NS
-MODULE_IMPORT_NS("DMA_BUF");
-#else
+//#ifdef HAVE_6_13_MODULE_IMPORT_NS
+//MODULE_IMPORT_NS("DMA_BUF");
+//#else
 MODULE_IMPORT_NS(DMA_BUF);
-#endif
+//#endif
 
 static int
 amdxdna_gem_heap_alloc(struct amdxdna_gem_obj *abo)
