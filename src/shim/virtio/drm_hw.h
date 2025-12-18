@@ -32,7 +32,7 @@ struct vaccel_drm_capset {
 #define VIRTGPU_DRM_CONTEXT_AMDGPU   2
 #define VIRTGPU_DRM_CONTEXT_AMDXDNA  3
    uint32_t context_type;
-   uint32_t use_hostmem;
+   uint32_t pad;
 };
 
 /**
