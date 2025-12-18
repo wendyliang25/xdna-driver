@@ -55,6 +55,7 @@ class vxdna_bo {
         uint64_t map_size;
         uint32_t bo_handle;
         uint32_t bo_type;
+        int opaque_handle;
         int ctx_fd;
     };
 
@@ -198,7 +199,6 @@ private:
         .version_minor = 0,
         .version_patchlevel = 0,
         .context_type = VIRTACCEL_DRM_CONTEXT_AMDXDNA,
-        .use_hostmem = 0,
     };
 };
 

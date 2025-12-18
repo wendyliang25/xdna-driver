@@ -38,6 +38,7 @@
 
 vxdna_bo::
 vxdna_bo(int ctx_fd_in, const struct amdxdna_ccmd_create_bo_req *req)
+         : opaque_handle(AMDXDNA_INVALID_BO_HANDLE)
 {
     struct amdxdna_drm_get_bo_info bo_info = {};
     struct amdxdna_drm_create_bo args = {};
@@ -72,6 +73,7 @@ vxdna_bo(int ctx_fd_in, const struct amdxdna_ccmd_create_bo_req *req)
 vxdna_bo::
 vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
          const struct amdxdna_ccmd_create_bo_req *req)
+         : opaque_handle(res->get_opaque_handle())
 {
     struct amdxdna_drm_get_bo_info bo_info = {};
     int ret;
@@ -94,7 +96,8 @@ vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
         tbl->va_entries[i].len = static_cast<uint64_t>(iovecs[i].iov_len);
         map_size += tbl->va_entries[i].len;
     }
-    if (res->get_opaque_handle() < 0) {
+
+    if (opaque_handle == AMDXDNA_INVALID_BO_HANDLE) {
         struct amdxdna_drm_create_bo args = {};
         args.vaddr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buf_vec.data()));
         args.size = size;
@@ -104,7 +107,7 @@ vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
             VACCEL_THROW_MSG(-errno, "Create bo failed ret %d, errno %d, %s", ret, -errno, strerror(errno));
         bo_handle = args.handle;
     } else {
-        bo_handle = res->get_opaque_handle();
+        bo_handle = opaque_handle;
     }
 
     bo_info.handle = bo_handle;
@@ -116,11 +119,21 @@ vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
     xdna_addr = bo_info.xdna_addr;
     vaddr = bo_info.vaddr;
 
-    if (vaddr != AMDXDNA_INVALID_ADDR) {
-        vxdna_dbg("BO already mapped: handle=%u, xdna_addr=%lx, vaddr=%lx", bo_handle, xdna_addr, vaddr);
+    if (map_offset == AMDXDNA_INVALID_ADDR) {
+        // TODO: in case of HOST memory, there is no iovecs, however, amdxdna driver today requires bo to have
+        // user pointer, and thus we still need to mmap bo here to provide user pointer.
+        if (bo_type != AMDXDNA_BO_DEV)
+            VACCEL_THROW_MSG(-EINVAL, "Non-DEV BO without map offset! handle=%u, type=%u", bo_handle, bo_type);
+        vxdna_dbg("No need to mmap for memory type, no map offset: handle=%u, xdna_addr=%lx, vaddr=%lx",
+                  bo_handle, xdna_addr, vaddr);
         return;
     }
 
+    if (!map_size)
+        map_size = size;
+
+    vxdna_dbg("mmap is required for handle: res_id=%u, handle=%u, opaque_handle=%d, vaddr=%lx, xdna_addr=%lx",
+              res->get_res_id(), bo_handle, res->get_opaque_handle(), vaddr, xdna_addr);
     // mmap is required for non-dev BOs
     uint64_t resv_vaddr = 0, resv_size = 0, va_to_map = 0;
     void *resv_va = nullptr;
@@ -142,7 +155,9 @@ vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
     if (va == MAP_FAILED) {
         if (resv_va && resv_va != MAP_FAILED)
             ::munmap(resv_va, resv_size);
-        VACCEL_THROW_MSG(-EFAULT, "Map bo failed");
+        VACCEL_THROW_MSG(-errno,
+                         "Map bo failed, errno %d, %s, to map startaddr 0x%lx, map_offset 0x%lx, map_size 0x%lx",
+                         errno, strerror(errno), va_to_map, map_offset, map_size);
     }
     vaddr = reinterpret_cast<uint64_t>(va);
 
@@ -151,19 +166,20 @@ vxdna_bo(const std::shared_ptr<vaccel_resource> &res, int ctx_fd_in,
     if (resv_vaddr + resv_size > vaddr + map_size)
         munmap((void *)(vaddr + map_size),
                (size_t)(resv_vaddr + resv_size - vaddr - map_size));
-    vxdna_dbg("Created BO with resource: type=%u, res_id=%u, num_iovs=%u", req->bo_type, req->res_id, num_iovs);
+    vxdna_dbg("Created BO with resource: type=%u, res_id=%u", req->bo_type, req->res_id);
 }
 
 vxdna_bo::
 ~vxdna_bo()
 {
-    vxdna_dbg("Destroying bo: ctx_fd=%d, handle=%u, vaddr=%lx, map_size=%lu", ctx_fd, bo_handle, vaddr, map_size);
+    vxdna_dbg("vxdna Destroying bo: ctx_fd=%d, handle=%u, vaddr=%lx, map_size=%lu",
+               ctx_fd, bo_handle, vaddr, map_size);
     if (vaddr != AMDXDNA_INVALID_ADDR)
         munmap(reinterpret_cast<void *>(vaddr), static_cast<size_t>(map_size));
     if (bo_handle != AMDXDNA_INVALID_BO_HANDLE) {
         struct drm_gem_close arg = {};
         arg.handle = bo_handle;
-        vxdna_dbg("Close bo: ctx_fd=%d, handle=%u", ctx_fd, bo_handle);
+        vxdna_dbg("vxdna Close bo: ctx_fd=%d, handle=%u", ctx_fd, bo_handle);
         auto ret = ioctl(ctx_fd, DRM_IOCTL_GEM_CLOSE, &arg);
         if (ret)
             vxdna_err("Close vxdna bo failed ret %d", ret);
@@ -219,7 +235,8 @@ vxdna_hwctx(const vxdna_context &ctx,
     if (!write_fence_callback)
         VACCEL_THROW_MSG(-EINVAL, "Write fence callback not found");
 
-    vxdna_dbg("Create hw context: ctx_fd=%d, max_opc=%u, num_tiles=%u, mem_size=%u", ctx_fd, req->max_opc, req->num_tiles, req->mem_size);
+    vxdna_dbg("Create hw context: ctx_fd=%d, max_opc=%u, num_tiles=%u, mem_size=%u",
+              ctx_fd, req->max_opc, req->num_tiles, req->mem_size);
     cookie = ctx.get_cookie();
     ctx_id = ctx.get_id();
 
@@ -614,11 +631,6 @@ fill_capset(uint32_t capset_size, void *capset_buf)
 
     /* Copy the capset structure to user buffer */
     memcpy(capset_buf, &vxdna::capset, sizeof(vxdna::capset));
-    auto use_hostmem = get_callbacks()->use_host_memory(get_cookie());
-    if (use_hostmem) {
-        struct vaccel_drm_capset *capset_p = static_cast<struct vaccel_drm_capset *>(capset_buf);
-        capset_p->use_hostmem = 1;
-    }
     vxdna_dbg("Capset structure filled for capset_id=%u, version=%u",
                get_capset_id(), vxdna::capset.version_major);
 }
@@ -664,6 +676,8 @@ create_resource_from_blob(const struct vaccel_create_resource_blob_args *args)
     auto res = std::make_shared<vaccel_resource>(args->res_handle, args->size,
                                                  opaque_handle, args->ctx_id);
     add_resource(args->res_handle, std::move(res));
+    vxdna_dbg("Created resource from blob: res_id=%u, opaque_handle=%d",
+              args->res_handle, opaque_handle);
 }
 
 void

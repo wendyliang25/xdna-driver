@@ -29,6 +29,7 @@ mmap(int fd)
 {
     if (map_addr)
         VACCEL_THROW_MSG(-EINVAL, "Resource already mapped");
+    vxdna_dbg("vaccel_resource::mmap: res_id=%u, fd=%d, ctx_id=%u, size=%zu", res_id, fd, ctx_id, size);
     map_addr = ::mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (map_addr == MAP_FAILED)
         VACCEL_THROW_MSG(-errno, "Failed to mmap resource: errno %d, %s", errno, strerror(errno));
@@ -131,6 +132,7 @@ _vaccel_create_resource_blob(void *cookie, const struct vaccel_create_resource_b
 static void
 _vaccel_resource_map(void *cookie, uint32_t res_id, void** data, size_t* size)
 {
+    vxdna_dbg("resource map: res_id=%u, cookie=%p", res_id, cookie);
     if (!cookie)
         VACCEL_THROW_MSG(-EINVAL, "Cookie is nullptr");
     auto device = vaccel_lookup(cookie);

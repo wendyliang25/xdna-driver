@@ -101,18 +101,6 @@ struct vaccel_callbacks {
      * @param fence_id Fence ID to write
      */
     void (*write_context_fence)(void *cookie, uint32_t ctx_id, uint32_t ring_idx, uint64_t fence_id);
-
-    /**
-     * @brief Check if host memory is used for shared memory
-     *
-     * This callback allows the renderer to query if host memory
-     * should be used for shared memory (for example, for efficient
-     * guest-host buffer sharing or zero-copy).
-     *
-     * @param cookie Device cookie
-     * @return true if host memory is used, false otherwise
-     */
-    bool (*use_host_memory)(void *cookie);
 };
 
 /**

@@ -123,7 +123,7 @@ public:
         , iovecs(iovecs_in)
         , num_iovecs(num_iovecs_in)
         , ctx_id(ctx_id_in)
-        , opaque_handle(-1)
+        , opaque_handle(0)
 
     {}
 
@@ -257,6 +257,8 @@ public:
     void
     munmap()
     {
+        vxdna_dbg("vaccel_resource::munmap: line %d, ctx_id=%u, res_id=%u, opaque_handle=%d, map_addr=%p",
+                  __LINE__, ctx_id, res_id, opaque_handle, map_addr);
         if (map_addr)
             ::munmap(map_addr, size);
         map_addr = NULL;
