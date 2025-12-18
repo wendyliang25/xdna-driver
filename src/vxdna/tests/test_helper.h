@@ -115,16 +115,6 @@ protected:
     static int getDeviceFdCallback(void *cookie);
 
     /**
-     * @brief Callback to check if host memory is used for shared memory
-     *
-     * Returns true if host memory is used for shared memory, false otherwise.
-     *
-     * @param cookie Test cookie
-     * @return true if host memory is used for shared memory, false otherwise
-     */
-    static bool useHostMemoryCallback(void *cookie);
-
-    /**
      * @brief Create a test device with the given capset ID
      *
      * @param capset_id Capability set ID

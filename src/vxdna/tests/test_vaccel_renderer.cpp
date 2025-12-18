@@ -394,7 +394,7 @@ TEST_F(VaccelRendererTest, FillCapsetVerifyStructure) {
               << ", version_minor=" << capset.version_minor
               << ", version_patchlevel=" << capset.version_patchlevel
               << ", context_type=" << capset.context_type
-              << ", use_hostmem=" << capset.use_hostmem << std::endl;
+              << ", pad=" << capset.pad << std::endl;
 }
 
 // =============================================================================
@@ -881,7 +881,7 @@ TEST_F(VaccelRendererTest, SubmitCcmdGetInfoInvalidResource) {
     struct vaccel_create_resource_blob_args resp_res_args = {};
     resp_res_args.res_handle = 100;
     resp_res_args.size = resp_buf.size();
-    resp_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    resp_res_args.blob_mem = VIRTGPU_BLOB_MEM_GUEST;
     resp_res_args.iovecs = &resp_iov;
     resp_res_args.num_iovs = 1;
 
@@ -934,7 +934,7 @@ TEST_F(VaccelRendererTest, SubmitCcmdGetInfoSingleValue) {
     struct vaccel_create_resource_blob_args resp_res_args = {};
     resp_res_args.res_handle = 100;
     resp_res_args.size = resp_buf.size();
-    resp_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    resp_res_args.blob_mem = VIRTGPU_BLOB_MEM_GUEST;
     resp_res_args.iovecs = &resp_iov;
     resp_res_args.num_iovs = 1;
 
@@ -942,7 +942,7 @@ TEST_F(VaccelRendererTest, SubmitCcmdGetInfoSingleValue) {
     ASSERT_EQ(ret, 0);
 
     // Create info resource
-    std::vector<uint8_t> info_buf(4096);
+    std::vector<uint8_t> info_buf(16*1024);
     struct vaccel_iovec info_iov = {
         .iov_base = info_buf.data(),
         .iov_len = info_buf.size()
@@ -951,7 +951,7 @@ TEST_F(VaccelRendererTest, SubmitCcmdGetInfoSingleValue) {
     struct vaccel_create_resource_blob_args info_res_args = {};
     info_res_args.res_handle = 101;
     info_res_args.size = info_buf.size();
-    info_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    info_res_args.blob_mem = VIRTGPU_BLOB_MEM_GUEST;
     info_res_args.iovecs = &info_iov;
     info_res_args.num_iovs = 1;
 
@@ -1012,7 +1012,7 @@ TEST_F(VaccelRendererTest, SubmitCcmdGetInfoArray) {
     struct vaccel_create_resource_blob_args resp_res_args = {};
     resp_res_args.res_handle = 100;
     resp_res_args.size = resp_buf.size();
-    resp_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    resp_res_args.blob_mem = VIRTGPU_BLOB_MEM_GUEST;
     resp_res_args.iovecs = &resp_iov;
     resp_res_args.num_iovs = 1;
 
@@ -1029,7 +1029,7 @@ TEST_F(VaccelRendererTest, SubmitCcmdGetInfoArray) {
     struct vaccel_create_resource_blob_args info_res_args = {};
     info_res_args.res_handle = 101;
     info_res_args.size = info_buf.size();
-    info_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    info_res_args.blob_mem = VIRTGPU_BLOB_MEM_GUEST;
     info_res_args.iovecs = &info_iov;
     info_res_args.num_iovs = 1;
 
@@ -1136,7 +1136,7 @@ TEST_F(VaccelRendererTest, SubmitCcmdReadSysfsValidNode) {
     struct vaccel_create_resource_blob_args resp_res_args = {};
     resp_res_args.res_handle = 100;
     resp_res_args.size = resp_buf.size();
-    resp_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    resp_res_args.blob_mem = VIRTGPU_BLOB_MEM_GUEST;
     resp_res_args.iovecs = &resp_iov;
     resp_res_args.num_iovs = 1;
 
@@ -1196,7 +1196,7 @@ TEST_F(VaccelRendererTest, SubmitCcmdReadSysfsInvalidNode) {
     struct vaccel_create_resource_blob_args resp_res_args = {};
     resp_res_args.res_handle = 100;
     resp_res_args.size = resp_buf.size();
-    resp_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    resp_res_args.blob_mem = VIRTGPU_BLOB_MEM_GUEST;
     resp_res_args.iovecs = &resp_iov;
     resp_res_args.num_iovs = 1;
 
@@ -1248,7 +1248,7 @@ TEST_F(VaccelRendererTest, SubmitCcmdReadSysfsEmptyNodeName) {
     struct vaccel_create_resource_blob_args resp_res_args = {};
     resp_res_args.res_handle = 100;
     resp_res_args.size = resp_buf.size();
-    resp_res_args.blob_mem = VACCEL_BLOB_MEM_GUEST;
+    resp_res_args.blob_mem = VIRTGPU_BLOB_MEM_GUEST;
     resp_res_args.iovecs = &resp_iov;
     resp_res_args.num_iovs = 1;
 
@@ -1307,7 +1307,7 @@ TEST_F(VaccelRendererTest, FullWorkflow) {
     EXPECT_GT(capset->version_major, 0);
     EXPECT_LE(capset->version_minor, capset->version_major);
     EXPECT_EQ(capset->context_type, VIRTACCEL_DRM_CONTEXT_AMDXDNA);
-    EXPECT_EQ(capset->use_hostmem, 0);
+    EXPECT_EQ(capset->pad, 0);
 
     // 5. Destroy device
     destroyTestDevice();
