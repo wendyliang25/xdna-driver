@@ -8,6 +8,9 @@
 #include <fcntl.h>
 #include <drm/drm.h>
 #include <sys/ioctl.h>
+#include <execinfo.h>
+#include <cstdlib>
+#include <cstring>
 
 namespace {
 
@@ -69,11 +72,29 @@ page_roundup(size_t size)
 }
 
 void
+dump_backtrace()
+{
+  void *array[32];
+  int size = backtrace(array, 32);
+  char **strings = backtrace_symbols(array, size);
+  fprintf(stderr, "\n=== SHIM BACKTRACE ===\n");
+  for (int i = 0; i < size; i++)
+    fprintf(stderr, "  [%d] %s\n", i, strings[i]);
+  fprintf(stderr, "======================\n\n");
+  free(strings);
+}
+
+void
 ioctl(int dev_fd, unsigned long cmd, void* arg)
 {
   XRT_TRACE_POINT_SCOPE2(ioctl, cmd, arg);
-  if (::ioctl(dev_fd, cmd, arg) == -1)
-    shim_err(-errno, "%s IOCTL failed", ioctl_cmd2name(cmd).c_str());
+  if (::ioctl(dev_fd, cmd, arg) == -1) {
+    int err = errno;
+    fprintf(stderr, "\n[SHIM ERROR] %s IOCTL failed (errno=%d: %s)\n",
+            ioctl_cmd2name(cmd).c_str(), err, strerror(err));
+    dump_backtrace();
+    shim_err(-err, "%s IOCTL failed", ioctl_cmd2name(cmd).c_str());
+  }
 }
 
 void

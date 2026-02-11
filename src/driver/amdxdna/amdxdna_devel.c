@@ -123,8 +123,9 @@ int amdxdna_bo_dma_map(struct amdxdna_gem_obj *abo)
 	/* Device doesn't do scatter/gather, fail non-contiguous map */
 	contig_sz = drm_prime_get_contiguous_size(sgt);
 	if (contig_sz != abo->mem.size) {
-		XDNA_ERR(xdna, "noncontiguous dma map, contig size:%ld, expected size:%ld",
-			 contig_sz, abo->mem.size);
+		XDNA_ERR(xdna, "noncontiguous dma map, contig size:%ld, expected size:%ld, is_import:%d",
+			 contig_sz, abo->mem.size, !!abo->attach);
+		dump_stack();
 		return -ENOMEM;
 	}
 
