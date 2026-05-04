@@ -10,7 +10,7 @@
  * amdxdna_shmem_init() to set up the transport.
  *
  * Communication with the remote firmware uses:
- *   - Two shared memory regions (mgmt mailbox + doorbell) from
+ *   - Three shared memory regions (mgmt TX, mgmt RX, doorbell) from
  *     reserved-memory, for the actual message data.
  *   - ZynqMP IPI mailbox channels (TX + RX) via the Linux mailbox
  *     framework for interrupt notification only — no IPI message
@@ -55,9 +55,11 @@ struct amdxdna_shmem_hdl {
 	struct amdxdna_dev_hdl	*ndev;
 	struct platform_device	*pdev;
 
-	/* Shared memory regions mapped from device tree reserved-memory */
-	void			*mgmt_shmem;
-	resource_size_t		mgmt_shmem_size;
+	/* TX, RX, and doorbell regions from device tree reserved-memory */
+	void			*mgmt_tx_shmem;
+	resource_size_t		mgmt_tx_size;
+	void			*mgmt_rx_shmem;
+	resource_size_t		mgmt_rx_size;
 	void			*db_shmem;
 	resource_size_t		db_shmem_size;
 
@@ -276,22 +278,22 @@ static void amdxdna_shmem_xcomm_fini(void *xcomm_hdl)
 
 static void amdxdna_shmem_rings_init(struct amdxdna_shmem_hdl *shdl)
 {
-	resource_size_t half = shdl->mgmt_shmem_size / 2;
 	resource_size_t ring_data;
 
-	/* Split mgmt region: first half is TX, second half is RX */
-	shdl->tx_hdr = (struct shmem_ring_hdr *)shdl->mgmt_shmem;
-	shdl->tx_ring = shdl->mgmt_shmem + sizeof(struct shmem_ring_hdr);
+	/* TX ring occupies the entire mgmt-tx region */
+	shdl->tx_hdr = (struct shmem_ring_hdr *)shdl->mgmt_tx_shmem;
+	shdl->tx_ring = shdl->mgmt_tx_shmem + sizeof(struct shmem_ring_hdr);
 
-	shdl->rx_hdr = (struct shmem_ring_hdr *)(shdl->mgmt_shmem + half);
-	shdl->rx_ring = shdl->mgmt_shmem + half +
-			sizeof(struct shmem_ring_hdr);
+	/* RX ring occupies the entire mgmt-rx region */
+	shdl->rx_hdr = (struct shmem_ring_hdr *)shdl->mgmt_rx_shmem;
+	shdl->rx_ring = shdl->mgmt_rx_shmem + sizeof(struct shmem_ring_hdr);
 
 	/*
-	 * Ring data area is the half minus the header.  Round down to the
-	 * largest power-of-2 so the mask has all lower bits set.
+	 * Ring data = region size minus header, rounded down to power-of-2
+	 * so the mask has all lower bits set.  Both regions are same size.
 	 */
-	ring_data = rounddown_pow_of_two(half - sizeof(struct shmem_ring_hdr));
+	ring_data = rounddown_pow_of_two(shdl->mgmt_tx_size -
+					 sizeof(struct shmem_ring_hdr));
 	shdl->tx_hdr->head = 0;
 	shdl->tx_hdr->tail = 0;
 	shdl->tx_hdr->ring_mask = ring_data - 1;
@@ -335,7 +337,9 @@ static const struct amdxdna_xcomm_ops amdxdna_shmem_xcomm_ops = {
 	.fini		= amdxdna_shmem_xcomm_fini,
 };
 
-static int amdxdna_shmem_map_regions(struct amdxdna_shmem_hdl *shdl)
+static int amdxdna_shmem_map_one(struct amdxdna_shmem_hdl *shdl,
+				 const char *name, void **out_va,
+				 resource_size_t *out_size)
 {
 	struct platform_device *pdev = shdl->pdev;
 	struct device_node *np = pdev->dev.of_node;
@@ -343,9 +347,9 @@ static int amdxdna_shmem_map_regions(struct amdxdna_shmem_hdl *shdl)
 	struct resource res;
 	int idx, ret;
 
-	idx = of_property_match_string(np, "memory-region-names", "mgmt");
+	idx = of_property_match_string(np, "memory-region-names", name);
 	if (idx < 0) {
-		dev_err(&pdev->dev, "missing 'mgmt' memory-region-names\n");
+		dev_err(&pdev->dev, "missing '%s' memory-region-names\n", name);
 		return idx;
 	}
 
@@ -358,40 +362,36 @@ static int amdxdna_shmem_map_regions(struct amdxdna_shmem_hdl *shdl)
 	if (ret)
 		return ret;
 
-	shdl->mgmt_shmem_size = resource_size(&res);
-	shdl->mgmt_shmem =
-		devm_ioremap_wc(&pdev->dev, res.start, shdl->mgmt_shmem_size);
-	if (!shdl->mgmt_shmem)
+	*out_size = resource_size(&res);
+	*out_va = devm_ioremap_wc(&pdev->dev, res.start, *out_size);
+	if (!*out_va)
 		return -ENOMEM;
 
-	dev_info(&pdev->dev, "mgmt shmem: %pa size 0x%llx\n",
-		 &res.start, (u64)shdl->mgmt_shmem_size);
-
-	idx = of_property_match_string(np, "memory-region-names", "doorbell");
-	if (idx < 0) {
-		dev_err(&pdev->dev, "missing 'doorbell' memory-region-names\n");
-		return idx;
-	}
-
-	mem_np = of_parse_phandle(np, "memory-region", idx);
-	if (!mem_np)
-		return -ENODEV;
-
-	ret = of_address_to_resource(mem_np, 0, &res);
-	of_node_put(mem_np);
-	if (ret)
-		return ret;
-
-	shdl->db_shmem_size = resource_size(&res);
-	shdl->db_shmem =
-		devm_ioremap_wc(&pdev->dev, res.start, shdl->db_shmem_size);
-	if (!shdl->db_shmem)
-		return -ENOMEM;
-
-	dev_info(&pdev->dev, "doorbell shmem: %pa size 0x%llx\n",
-		 &res.start, (u64)shdl->db_shmem_size);
-
+	dev_info(&pdev->dev, "%s shmem: %pa size 0x%llx\n",
+		 name, &res.start, (u64)*out_size);
 	return 0;
+}
+
+static int amdxdna_shmem_map_regions(struct amdxdna_shmem_hdl *shdl)
+{
+	int ret;
+
+	ret = amdxdna_shmem_map_one(shdl, "mgmt-tx",
+				    &shdl->mgmt_tx_shmem,
+				    &shdl->mgmt_tx_size);
+	if (ret)
+		return ret;
+
+	ret = amdxdna_shmem_map_one(shdl, "mgmt-rx",
+				    &shdl->mgmt_rx_shmem,
+				    &shdl->mgmt_rx_size);
+	if (ret)
+		return ret;
+
+	ret = amdxdna_shmem_map_one(shdl, "doorbell",
+				    &shdl->db_shmem,
+				    &shdl->db_shmem_size);
+	return ret;
 }
 
 static int amdxdna_shmem_mbox_init(struct amdxdna_shmem_hdl *shdl)
