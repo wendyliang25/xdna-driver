@@ -221,16 +221,27 @@ void *amdxdna_gem_vmap(struct amdxdna_gem_obj *abo)
 	if (abo->mem.kva)
 		return abo->mem.kva;
 
-	/* The first call to get the kva, taking slow path. */
-	guard(mutex)(&abo->lock);
-
-	if (!abo->mem.kva) {
-		ret = drm_gem_vmap(to_gobj(abo), &map);
-		if (ret)
-			XDNA_ERR(abo->client->xdna, "Vmap bo failed, ret %d", ret);
-		else
-			abo->mem.kva = map.vaddr;
+	/*
+	 * drm_gem_vmap() may map a different BO (e.g. dev BO -> heap chunk).
+	 * Do not hold abo->lock across it: all abo->lock are the same class.
+	 */
+	ret = drm_gem_vmap(to_gobj(abo), &map);
+	if (ret) {
+		XDNA_ERR(abo->client->xdna, "Vmap bo failed, ret %d", ret);
+		return NULL;
 	}
+
+	mutex_lock(&abo->lock);
+	if (!abo->mem.kva) {
+		abo->mem.kva = map.vaddr;
+	} else {
+		struct iosys_map dup = IOSYS_MAP_INIT_VADDR(map.vaddr);
+
+		mutex_unlock(&abo->lock);
+		drm_gem_vunmap(to_gobj(abo), &dup);
+		return abo->mem.kva;
+	}
+	mutex_unlock(&abo->lock);
 	return abo->mem.kva;
 }
 
