@@ -7,8 +7,9 @@
  *
  * Shared memory is mapped via devm_ioremap_wc() (Normal Non-Cacheable
  * on ARM64).  Bulk data copies use memcpy_toio/memcpy_fromio (the
- * kernel-sanctioned accessors for IO-mapped memory); single u32 index
- * updates use plain stores.  dma_wmb()/dma_rmb() order data vs. index
+ * kernel-sanctioned accessors for IO-mapped memory); single u64 index
+ * updates use plain stores with natural 8-byte alignment guaranteeing
+ * atomicity on AArch64.  dma_wmb()/dma_rmb() order data vs. index
  * updates across the non-coherent boundary.
  * Both sides are little-endian, so no byte-swap is needed.
  */
@@ -18,6 +19,7 @@
 
 #include <asm/barrier.h>
 #include <linux/bitfield.h>
+#include <linux/build_bug.h>
 #include <linux/compiler.h>
 #include <linux/io.h>
 #include <linux/platform_device.h>
@@ -28,15 +30,28 @@ struct amdxdna_dev;
 int amdxdna_shmem_init(struct amdxdna_dev *xdna, struct platform_device *pdev);
 void amdxdna_shmem_fini(struct amdxdna_dev *xdna);
 /*
- * Management ring header -- sits at the start of each TX/RX ring region.
- * Followed by ring_mask+1 bytes of ring data.
+ * HSA-aligned ring control header for shmem SPSC transport.
+ *
+ * Follows the HSA queue convention: write_index and read_index are 64-bit,
+ * naturally 8-byte aligned, and placed on separate 64-byte cache lines to
+ * eliminate false sharing between producer and consumer cores.
+ *
+ * This struct is the on-wire ABI shared between APU (Linux) and RPU
+ * (Zephyr).  Both sides must use the same layout.  Sits at the start of
+ * each TX/RX; followed by (ring_mask + 1) bytes of ring data.
  */
 struct shmem_ring_hdr {
-	u32 head;
-	u32 tail;
-	u32 ring_mask;
-	u32 rsvd;
-};
+	u64 write_index;		/* offset  0: producer index           */
+	u64 ring_mask;			/* offset  8: (ring_data_size - 1)     */
+	u64 rsvd;			/* offset 16: reserved / FW alive magic */
+	u8  _pad0[40];			/* offset 24: pad to cache line boundary */
+	/* --- 64-byte cache line boundary --- */
+	u64 read_index;			/* offset 64: consumer index           */
+	u8  _pad1[56];			/* offset 72: pad to 128-byte total    */
+} __aligned(64);
+
+static_assert(offsetof(struct shmem_ring_hdr, read_index) == 64);
+static_assert(sizeof(struct shmem_ring_hdr) == 128);
 
 /*
  * Per-message header inside the management ring data area.
@@ -68,49 +83,58 @@ struct shmem_msg_hdr {
 #define SHMEM_TOMBSTONE	0xDEADFACE
 
 /*
- * Doorbell ring -- the entire doorbell memory-region is one of these.
- * Each data[] slot carries a hw_ctx_id.
+ * HSA-aligned doorbell ring for hw_ctx dispatch notification.
+ *
+ * Same cache-line-separated index layout as shmem_ring_hdr.
+ * The flexible data[] array (u32 hw_ctx_id slots) begins at offset 128.
+ * Linux produces; RPU firmware consumes.
  */
 struct shmem_db_ring {
-	u32 head;
-	u32 tail;
-	u32 ring_mask;
-	u32 rsvd;
+	u64 write_index;		/* offset  0: producer index       */
+	u64 ring_mask;			/* offset  8: (num_slots - 1)      */
+	u64 rsvd;			/* offset 16: reserved             */
+	u8  _pad0[40];			/* offset 24: pad to cache line    */
+	/* --- 64-byte cache line boundary --- */
+	u64 read_index;			/* offset 64: consumer index       */
+	u8  _pad1[56];			/* offset 72: pad to 128 bytes     */
+	/* --- data starts at offset 128 --- */
 	u32 data[];
-};
+} __aligned(64);
+
+static_assert(offsetof(struct shmem_db_ring, read_index) == 64);
+static_assert(offsetof(struct shmem_db_ring, data) == 128);
 
 /*
  * Management ring -- produce (host writes to TX ring).
  *
- * @hdr:         ring header in shared memory
- * @ring_base:   ring data area (right after the header)
- * @local_head:  caller's cached head (updated on return)
- * @cached_tail: caller's cached copy of firmware's tail (re-read if ring full)
- * @msg_hdr:     message header values (caller fills total_size, sz_ver, id, opcode)
- * @payload:     message payload (kernel memory)
- * @payload_size: payload size in bytes
+ * @hdr:              ring header in shared memory
+ * @ring_base:        ring data area (right after the header)
+ * @local_write_idx:  caller's cached write_index (updated on return)
+ * @cached_read_idx:  caller's cached copy of firmware's read_index
+ * @msg_hdr:          message header values
+ * @payload:          message payload (kernel memory)
+ * @payload_size:     payload size in bytes
  *
  * Returns 0 on success, -ENOSPC if ring is full.
  *
  * If the message does not fit between the current offset and the ring-end
  * boundary, a TOMBSTONE sentinel is written and the offset resets to 0.
- * The consumer detects the tombstone and skips past it.
  */
 static inline int shmem_mgmt_produce(struct shmem_ring_hdr *hdr,
 				     void *ring_base,
-				     u32 *local_head, u32 *cached_tail,
+				     u64 *local_write_idx, u64 *cached_read_idx,
 				     const struct shmem_msg_hdr *msg_hdr,
 				     const void *payload, size_t payload_size)
 {
-	u32 mask = hdr->ring_mask;
-	u32 size = mask + 1;
-	u32 head = *local_head;
+	u64 mask = hdr->ring_mask;
+	u64 size = mask + 1;
+	u64 head = *local_write_idx;
 	u32 total = sizeof(*msg_hdr) + payload_size;
-	u32 off, gap;
+	u64 off, gap;
 
-	if (head - *cached_tail + total > size) {
-		*cached_tail = hdr->tail;
-		if (head - *cached_tail + total > size)
+	if (head - *cached_read_idx + total > size) {
+		*cached_read_idx = hdr->read_index;
+		if (head - *cached_read_idx + total > size)
 			return -ENOSPC;
 	}
 
@@ -121,9 +145,9 @@ static inline int shmem_mgmt_produce(struct shmem_ring_hdr *hdr,
 		*(u32 *)(ring_base + off) = SHMEM_TOMBSTONE;
 		head += gap;
 
-		if (head - *cached_tail + total > size) {
-			*cached_tail = hdr->tail;
-			if (head - *cached_tail + total > size)
+		if (head - *cached_read_idx + total > size) {
+			*cached_read_idx = hdr->read_index;
+			if (head - *cached_read_idx + total > size)
 				return -ENOSPC;
 		}
 		off = head & mask;
@@ -137,8 +161,8 @@ static inline int shmem_mgmt_produce(struct shmem_ring_hdr *hdr,
 	dma_wmb();
 
 	head += total;
-	hdr->head = head;
-	*local_head = head;
+	hdr->write_index = head;
+	*local_write_idx = head;
 
 	return 0;
 }
@@ -146,13 +170,13 @@ static inline int shmem_mgmt_produce(struct shmem_ring_hdr *hdr,
 /*
  * Management ring -- consume (host reads from RX ring).
  *
- * @hdr:          ring header in shared memory
- * @ring_base:    ring data area
- * @local_tail:   caller's cached tail (updated on return)
- * @cached_head:  caller's cached copy of firmware's head (re-read if empty)
- * @msg_hdr:      output message header
- * @payload:      output buffer for payload (kernel memory)
- * @payload_max:  maximum payload bytes to copy
+ * @hdr:               ring header in shared memory
+ * @ring_base:         ring data area
+ * @local_read_idx:    caller's cached read_index (updated on return)
+ * @cached_write_idx:  caller's cached copy of firmware's write_index
+ * @msg_hdr:           output message header
+ * @payload:           output buffer for payload (kernel memory)
+ * @payload_max:       maximum payload bytes to copy
  *
  * Returns payload size on success, -EAGAIN if ring is empty, -EOVERFLOW
  * if the message payload exceeds payload_max.
@@ -162,18 +186,19 @@ static inline int shmem_mgmt_produce(struct shmem_ring_hdr *hdr,
  */
 static inline int shmem_mgmt_consume(struct shmem_ring_hdr *hdr,
 				     void *ring_base,
-				     u32 *local_tail, u32 *cached_head,
+				     u64 *local_read_idx, u64 *cached_write_idx,
 				     struct shmem_msg_hdr *msg_hdr,
 				     void *payload, size_t payload_max)
 {
-	u32 mask = hdr->ring_mask;
-	u32 size = mask + 1;
-	u32 tail = *local_tail;
-	u32 off, payload_size;
+	u64 mask = hdr->ring_mask;
+	u64 size = mask + 1;
+	u64 tail = *local_read_idx;
+	u64 off;
+	u32 payload_size;
 
-	if (*cached_head == tail) {
-		*cached_head = hdr->head;
-		if (*cached_head == tail)
+	if (*cached_write_idx == tail) {
+		*cached_write_idx = hdr->write_index;
+		if (*cached_write_idx == tail)
 			return -EAGAIN;
 	}
 
@@ -185,8 +210,8 @@ static inline int shmem_mgmt_consume(struct shmem_ring_hdr *hdr,
 		tail += size - off;
 		off = tail & mask;
 
-		*cached_head = hdr->head;
-		if (*cached_head == tail)
+		*cached_write_idx = hdr->write_index;
+		if (*cached_write_idx == tail)
 			return -EAGAIN;
 
 		dma_rmb();
@@ -205,8 +230,8 @@ static inline int shmem_mgmt_consume(struct shmem_ring_hdr *hdr,
 	dma_wmb();
 
 	tail += msg_hdr->total_size;
-	hdr->tail = tail;
-	*local_tail = tail;
+	hdr->read_index = tail;
+	*local_read_idx = tail;
 
 	return payload_size;
 }
@@ -214,24 +239,24 @@ static inline int shmem_mgmt_consume(struct shmem_ring_hdr *hdr,
 /*
  * Doorbell ring -- produce (host writes hw_ctx_id).
  *
- * @ring:        doorbell ring in shared memory
- * @local_head:  caller's cached head (updated on return)
- * @cached_tail: caller's cached copy of firmware's tail
- * @hw_ctx_id:   hardware context ID to write
+ * @ring:             doorbell ring in shared memory
+ * @local_write_idx:  caller's cached write_index (updated on return)
+ * @cached_read_idx:  caller's cached copy of firmware's read_index
+ * @hw_ctx_id:        hardware context ID to write
  *
  * Returns 0 on success, -ENOSPC if ring is full.
  */
 static inline int shmem_db_produce(struct shmem_db_ring *ring,
-				   u32 *local_head, u32 *cached_tail,
+				   u64 *local_write_idx, u64 *cached_read_idx,
 				   u32 hw_ctx_id)
 {
-	u32 mask = ring->ring_mask;
-	u32 size = mask + 1;
-	u32 head = *local_head;
+	u64 mask = ring->ring_mask;
+	u64 size = mask + 1;
+	u64 head = *local_write_idx;
 
-	if (head - *cached_tail >= size) {
-		*cached_tail = ring->tail;
-		if (head - *cached_tail >= size)
+	if (head - *cached_read_idx >= size) {
+		*cached_read_idx = ring->read_index;
+		if (head - *cached_read_idx >= size)
 			return -ENOSPC;
 	}
 
@@ -240,8 +265,8 @@ static inline int shmem_db_produce(struct shmem_db_ring *ring,
 	dma_wmb();
 
 	head++;
-	ring->head = head;
-	*local_head = head;
+	ring->write_index = head;
+	*local_write_idx = head;
 
 	return 0;
 }

@@ -73,21 +73,21 @@ struct amdxdna_shmem_hdl {
 	struct shmem_db_ring	*db_ring;
 
 	/* Cached indices to minimise shared memory reads */
-	u32			tx_local_head;
-	u32			tx_cached_tail;
-	u32			rx_local_tail;
-	u32			rx_cached_head;
-	u32			db_local_head;
-	u32			db_cached_tail;
+	u64			tx_local_write_idx;
+	u64			tx_cached_read_idx;
+	u64			rx_local_read_idx;
+	u64			rx_cached_write_idx;
+	u64			db_local_write_idx;
+	u64			db_cached_read_idx;
 
 	/* Inflight management message tracking */
 	struct xarray		msg_xa;
-	spinlock_t		msg_id_lock;
+	spinlock_t		msg_id_lock; /* protects next_msg_id + xa_insert */
 	u32			next_msg_id;
 
 	/* Produce-path locks (protect ring write + IPI send atomically) */
-	spinlock_t		tx_lock;
-	spinlock_t		db_lock;
+	spinlock_t		tx_lock; /* protects mgmt TX ring + IPI */
+	spinlock_t		db_lock; /* protects doorbell ring + IPI */
 
 	/* Linux mailbox client for ZynqMP IPI (notification only) */
 	struct mbox_client	tx_cl;
@@ -102,7 +102,6 @@ struct amdxdna_shmem_hdl {
 
 /* Maximum response payload we expect from firmware (fits on kernel stack) */
 #define SHMEM_MAX_RESP_SIZE	512
-
 
 static void amdxdna_shmem_doorbell_notify(struct amdxdna_dev_hdl *ndev)
 {
@@ -125,8 +124,8 @@ static void amdxdna_shmem_rx_work(struct work_struct *work)
 	/* Drain all available management responses */
 	while (shdl->rx_hdr) {
 		payload_size = shmem_mgmt_consume(shdl->rx_hdr, shdl->rx_ring,
-						  &shdl->rx_local_tail,
-						  &shdl->rx_cached_head,
+						  &shdl->rx_local_read_idx,
+						  &shdl->rx_cached_write_idx,
 						  &msg_hdr, buf, sizeof(buf));
 		if (payload_size < 0)
 			break;
@@ -209,8 +208,8 @@ static int amdxdna_shmem_send_msg(void *xcomm_hdl,
 
 	spin_lock(&shdl->tx_lock);
 	ret = shmem_mgmt_produce(shdl->tx_hdr, shdl->tx_ring,
-				 &shdl->tx_local_head,
-				 &shdl->tx_cached_tail,
+				 &shdl->tx_local_write_idx,
+				 &shdl->tx_cached_read_idx,
 				 &hdr, msg->send_data, msg->send_size);
 	if (ret)
 		goto unlock_tx;
@@ -237,8 +236,8 @@ static int amdxdna_shmem_ring_doorbell(void *xcomm_hdl, u32 hw_ctx_id)
 
 	spin_lock(&shdl->db_lock);
 	ret = shmem_db_produce(shdl->db_ring,
-			       &shdl->db_local_head,
-			       &shdl->db_cached_tail,
+			       &shdl->db_local_write_idx,
+			       &shdl->db_cached_read_idx,
 			       hw_ctx_id);
 	if (ret)
 		goto unlock;
@@ -292,13 +291,13 @@ static void amdxdna_shmem_rings_init(struct amdxdna_shmem_hdl *shdl)
 	 * largest power-of-2 so the mask has all lower bits set.
 	 */
 	ring_data = rounddown_pow_of_two(half - sizeof(struct shmem_ring_hdr));
-	shdl->tx_hdr->head = 0;
-	shdl->tx_hdr->tail = 0;
+	shdl->tx_hdr->write_index = 0;
+	shdl->tx_hdr->read_index = 0;
 	shdl->tx_hdr->ring_mask = ring_data - 1;
 	shdl->tx_hdr->rsvd = 0;
 
-	shdl->rx_hdr->head = 0;
-	shdl->rx_hdr->tail = 0;
+	shdl->rx_hdr->write_index = 0;
+	shdl->rx_hdr->read_index = 0;
 	shdl->rx_hdr->ring_mask = ring_data - 1;
 	shdl->rx_hdr->rsvd = 0;
 
@@ -307,18 +306,18 @@ static void amdxdna_shmem_rings_init(struct amdxdna_shmem_hdl *shdl)
 	ring_data = (shdl->db_shmem_size - offsetof(struct shmem_db_ring, data))
 		    / sizeof(u32);
 	ring_data = rounddown_pow_of_two(ring_data);
-	shdl->db_ring->head = 0;
-	shdl->db_ring->tail = 0;
+	shdl->db_ring->write_index = 0;
+	shdl->db_ring->read_index = 0;
 	shdl->db_ring->ring_mask = ring_data - 1;
 	shdl->db_ring->rsvd = 0;
 
 	/* Reset local cached indices */
-	shdl->tx_local_head = 0;
-	shdl->tx_cached_tail = 0;
-	shdl->rx_local_tail = 0;
-	shdl->rx_cached_head = 0;
-	shdl->db_local_head = 0;
-	shdl->db_cached_tail = 0;
+	shdl->tx_local_write_idx = 0;
+	shdl->tx_cached_read_idx = 0;
+	shdl->rx_local_read_idx = 0;
+	shdl->rx_cached_write_idx = 0;
+	shdl->db_local_write_idx = 0;
+	shdl->db_cached_read_idx = 0;
 
 	xa_init(&shdl->msg_xa);
 	spin_lock_init(&shdl->msg_id_lock);
