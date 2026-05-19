@@ -218,7 +218,6 @@ int amdxdna_plat_register_device(struct amdxdna_dev *xdna)
 		return -ENOMEM;
 	}
 
-#ifndef CONFIG_AMDXDNA_SHMEM
 	if (xdna->dev_info->ops && xdna->dev_info->ops->init) {
 		ret = xdna->dev_info->ops->init(xdna);
 		if (ret) {
@@ -226,7 +225,6 @@ int amdxdna_plat_register_device(struct amdxdna_dev *xdna)
 			goto destroy_wq;
 		}
 	}
-#endif
 
 	ret = amdxdna_sysfs_init(xdna);
 	if (ret) {
@@ -255,11 +253,9 @@ int amdxdna_plat_register_device(struct amdxdna_dev *xdna)
 sysfs_fini:
 	amdxdna_sysfs_fini(xdna);
 fini_dev:
-#ifndef CONFIG_AMDXDNA_SHMEM
 	if (xdna->dev_info->ops && xdna->dev_info->ops->fini)
 		xdna->dev_info->ops->fini(xdna);
 destroy_wq:
-#endif
 	destroy_workqueue(xdna->notifier_wq);
 	xdna->notifier_wq = NULL;
 	return ret;
@@ -291,10 +287,8 @@ void amdxdna_plat_unregister_device(struct amdxdna_dev *xdna)
 	amdxdna_sysfs_fini(xdna);
 	amdxdna_rpm_fini(xdna);
 	pm_runtime_disable(dev);
-#ifndef CONFIG_AMDXDNA_SHMEM
 	if (xdna->dev_info->ops && xdna->dev_info->ops->fini)
 		xdna->dev_info->ops->fini(xdna);
-#endif
 	destroy_workqueue(xdna->notifier_wq);
 	xdna->notifier_wq = NULL;
 
