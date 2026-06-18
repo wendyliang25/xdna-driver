@@ -1489,6 +1489,26 @@ int amdxdna_gem_sync_range(struct amdxdna_gem_obj *abo, u64 offset, u64 size,
 	if (ret != -ENODEV)
 		return ret;
 
+	/*
+	 * Generic DMA-API cache maintenance for any other BO that carries a
+	 * device DMA address (e.g. userptr/ubuf imports).  This is the path
+	 * for all non-CMA-exporter buffer types on noncoherent CMA platforms.
+	 * Sync against the device the BO was actually mapped against (the
+	 * importer's attach device when present), so the dma_addr->phys
+	 * translation is correct.  The drm_clflush_* fallbacks below are
+	 * no-ops on non-x86 (arm64) and would silently skip the flush.
+	 */
+	if (abo->mem.dma_addr) {
+		struct device *sdev = abo->attach ? abo->attach->dev : xdna->ddev.dev;
+		dma_addr_t pa = abo->mem.dma_addr + offset;
+
+		if (dir == DMA_FROM_DEVICE)
+			dma_sync_single_for_cpu(sdev, pa, size, dir);
+		else
+			dma_sync_single_for_device(sdev, pa, size, dir);
+		return 0;
+	}
+
 	if (amdxdna_gem_vmap(abo)) {
 		drm_clflush_virt_range(amdxdna_gem_vmap(abo) + offset, size);
 		return 0;
