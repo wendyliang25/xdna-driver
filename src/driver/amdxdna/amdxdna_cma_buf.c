@@ -159,15 +159,10 @@ static int amdxdna_cmabuf_mmap(struct dma_buf *dbuf, struct vm_area_struct *vma)
 	 * dma_alloc_noncoherent().
 	 *
 	 * Do NOT set VM_IO either -- the underlying memory is normal
-	 * cached RAM, not MMIO.  The dma_buf/DRM mmap path hands us a
-	 * write-combine vm_page_prot, so force it back to this VMA's
-	 * default cached (Normal-WB) protection: a mismatched-attribute
-	 * alias (kernel WB vs userspace NC) of the same page is
-	 * architecturally unpredictable on arm64 and tears data.
+	 * cached RAM, not MMIO.  vma->vm_page_prot is left at its default
+	 * (cached) by the dma_buf framework.
 	 */
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
-
-	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 
 	return remap_pfn_range(vma, vma->vm_start,
 			       virt_to_pfn(cmabuf->cpu_addr),
@@ -228,15 +223,6 @@ static struct dma_buf *amdxdna_get_cma_buf(struct amdxdna_dev *xdna,
 	cmabuf->cpu_addr = cpu_addr;
 	cmabuf->dma_addr = dma_addr;
 	cmabuf->size = size;
-
-	/*
-	 * Drop any stale dirty cache lines left on these recycled CMA pages
-	 * so they cannot write back over the device's DMA results later: an
-	 * output-only BO is never sync(TO_DEVICE)'d by userspace, so nothing
-	 * else would flush them.  After this, coherency is governed entirely
-	 * by the explicit sync_bo path.
-	 */
-	dma_sync_single_for_device(dev, dma_addr, size, DMA_BIDIRECTIONAL);
 
 	exp_info.size = size;
 	exp_info.ops = &amdxdna_cmabuf_dmabuf_ops;
