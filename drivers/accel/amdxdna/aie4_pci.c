@@ -590,6 +590,7 @@ static int aie4m_pcidev_init(struct amdxdna_dev *xdna)
 		set_bit(SMU_REG_BAR(ndev, i), &bars);
 	set_bit(xdna->dev_info->mbox_bar, &bars);
 	set_bit(xdna->dev_info->sram_bar, &bars);
+	set_bit(xdna->dev_info->doorbell_bar, &bars);
 
 	for (i = 0; i < PCI_NUM_RESOURCES; i++) {
 		if (!test_bit(i, &bars))
@@ -603,6 +604,7 @@ static int aie4m_pcidev_init(struct amdxdna_dev *xdna)
 
 	ndev->mbox_base = tbl[xdna->dev_info->mbox_bar];
 	ndev->rbuf_base = tbl[xdna->dev_info->sram_bar];
+	ndev->doorbell_base = tbl[xdna->dev_info->doorbell_bar];
 
 	pci_set_master(pdev);
 
@@ -635,7 +637,7 @@ static int aie4_doorbell_mmap(struct amdxdna_client *client, struct vm_area_stru
 	struct amdxdna_dev *xdna = client->xdna;
 	struct pci_dev *pdev = to_pci_dev(xdna->ddev.dev);
 	const struct amdxdna_dev_priv *npriv = xdna->dev_info->dev_priv;
-	phys_addr_t res_start;
+	phys_addr_t res_start, res_end;
 	unsigned long pfn;
 	int ret;
 
@@ -650,7 +652,12 @@ static int aie4_doorbell_mmap(struct amdxdna_client *client, struct vm_area_stru
 	}
 
 	res_start = pci_resource_start(pdev, xdna->dev_info->doorbell_bar) + npriv->doorbell_off;
+	res_end = pci_resource_end(pdev, xdna->dev_info->doorbell_bar);
 	pfn = PHYS_PFN(res_start) + vma->vm_pgoff;
+	if (pfn > PHYS_PFN(res_end)) {
+		XDNA_ERR(xdna, "doorbell page offset 0x%lx out of BAR", vma->vm_pgoff);
+		return -EINVAL;
+	}
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 	ret = io_remap_pfn_range(vma, vma->vm_start,
@@ -1240,6 +1247,7 @@ const struct amdxdna_dev_ops aie4_vf_ops = {
 	.hwctx_fini		= aie4_hwctx_fini,
 	.hwctx_config		= aie4_hwctx_config,
 	.mmap			= aie4_doorbell_mmap,
+	.cmd_submit		= aie4_cmd_submit,
 	.cmd_wait		= aie4_cmd_wait,
 	.get_aie_info		= aie4_get_info,
 	.set_aie_state		= aie4_set_state,
@@ -1255,6 +1263,7 @@ const struct amdxdna_dev_ops aie4_classic_ops = {
 	.hwctx_fini		= aie4_hwctx_fini,
 	.hwctx_config		= aie4_hwctx_config,
 	.mmap			= aie4_doorbell_mmap,
+	.cmd_submit		= aie4_cmd_submit,
 	.cmd_wait		= aie4_cmd_wait,
 	.get_aie_info		= aie4_get_info,
 	.set_aie_state		= aie4_set_state,
