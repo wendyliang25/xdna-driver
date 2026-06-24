@@ -35,6 +35,13 @@ module_param(kernel_mode_submission, int, 0600);
 MODULE_PARM_DESC(kernel_mode_submission,
 		 "aie4 I/O submission: 0 - by user, 1 - by driver (default)");
 
+#define KERNEL_SUBMIT_TIMEOUT_MS_DEFAULT	2000
+
+static u32 kernel_submit_timeout_ms = KERNEL_SUBMIT_TIMEOUT_MS_DEFAULT;
+module_param(kernel_submit_timeout_ms, uint, 0600);
+MODULE_PARM_DESC(kernel_submit_timeout_ms,
+		 "aie4 kernel-mode per-job completion timeout in ms (0 - use default)");
+
 static void job_worker(struct work_struct *work);
 static void aie4_hwctx_cleanup_running_jobs(struct amdxdna_hwctx *hwctx);
 
@@ -651,14 +658,31 @@ static bool job_check_done(struct amdxdna_hwctx *hwctx, u64 seq)
 static int wait_till_seq_completed(struct amdxdna_hwctx *hwctx, u64 seq)
 {
 	struct cert_comp *cert_comp = aie4_get_cert_comp(hwctx);
+	u32 timeout_ms;
+	long ret;
 
 	if (!cert_comp)
 		return -EAGAIN;
 
-	wait_event(cert_comp->waitq, job_check_done(hwctx, seq));
+	/*
+	 * Always bound the wait so an unresponsive CERT cannot park the job
+	 * worker in an uninterruptible sleep forever (which would also block ctx
+	 * teardown and module unload).  A timeout re-checks read_index, so a
+	 * completion whose MSI-X was lost is still observed.
+	 */
+	timeout_ms = kernel_submit_timeout_ms ? kernel_submit_timeout_ms :
+						KERNEL_SUBMIT_TIMEOUT_MS_DEFAULT;
+
+	ret = wait_event_timeout(cert_comp->waitq, job_check_done(hwctx, seq),
+				 msecs_to_jiffies(timeout_ms));
 	aie4_put_cert_comp(cert_comp);
 
-	return (hwctx->priv->status != CTX_STATE_CONNECTED) ? -EAGAIN : 0;
+	/* Lockless read; status is written under io_lock by destroy/job_timeout. */
+	if (READ_ONCE(hwctx->priv->status) != CTX_STATE_CONNECTED)
+		return -EAGAIN;
+
+	/* Condition stayed false until the deadline: CERT did not complete. */
+	return ret ? 0 : -ETIME;
 }
 
 static int wait_till_hsa_not_full(struct amdxdna_hwctx *hwctx)
@@ -1072,7 +1096,8 @@ static void job_worker(struct work_struct *work)
 	struct amdxdna_sched_job *job;
 
 	while ((job = next_running_job(hwctx))) {
-		wait_till_seq_completed(hwctx, job->seq);
+		int ret = wait_till_seq_completed(hwctx, job->seq);
+
 		trace_amdxdna_debug_point(hwctx->name, job->seq, "job complete");
 
 		if (get_read_index(hwctx) > job->seq) {
@@ -1085,7 +1110,7 @@ static void job_worker(struct work_struct *work)
 			if (job->aie4_job_state != JOB_STATE_SUBMITTED)
 				amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_ABORT);
 			job_complete(job);
-		} else {
+		} else if (ret != -ETIME) {
 			/*
 			 * Disconnected (firmware quiesced by destroy on the teardown or
 			 * TDR-reset path) - safe to reap.  If an async fault report was
@@ -1097,6 +1122,19 @@ static void job_worker(struct work_struct *work)
 				job_timeout(job);
 			else
 				job_abort(job);
+		} else {
+			/*
+			 * Software-timeout backstop: CERT is silent but the context is
+			 * still connected and may merely be slow.  Do not reclaim a
+			 * possibly-live job - that would drop the mm pin and BO refs
+			 * while the device might still DMA into them.  Requeue and
+			 * re-wait; a later pass completes it if CERT was just slow,
+			 * otherwise ctx teardown or the TDR reset reaps it.
+			 */
+			mutex_lock(&priv->io_lock);
+			list_add(&job->aie4_job_list, &priv->running_job_list);
+			mutex_unlock(&priv->io_lock);
+			continue;
 		}
 	}
 }
