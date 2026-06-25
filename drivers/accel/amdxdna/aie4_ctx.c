@@ -262,14 +262,24 @@ int aie4_hwctx_create(struct amdxdna_hwctx *hwctx)
 		 * space (hand back an invalid offset so the doorbell cannot be
 		 * mmap'd/rung by the user).
 		 */
+		/*
+		 * Publish doorbell_addr and CONNECTED together under io_lock so a
+		 * concurrent kernel-mode submitter (which reads status and rings the
+		 * doorbell under io_lock) cannot, on a TDR recreate of a live ctx,
+		 * observe CONNECTED with a stale doorbell_addr on a weakly-ordered
+		 * architecture and ring writel(0, NULL).
+		 */
+		mutex_lock(&priv->io_lock);
 		priv->doorbell_addr = ndev->doorbell_base +
 				      ndev->priv->doorbell_off + resp.doorbell_offset;
+		priv->status = CTX_STATE_CONNECTED;
+		mutex_unlock(&priv->io_lock);
 		hwctx->doorbell_offset = CTX_INVALID_DOORBELL;
 	} else {
 		/* User-mode submission: hand the doorbell to user space to ring. */
 		hwctx->doorbell_offset = resp.doorbell_offset;
+		priv->status = CTX_STATE_CONNECTED;
 	}
-	priv->status = CTX_STATE_CONNECTED;
 
 	return 0;
 }
@@ -285,10 +295,25 @@ void aie4_hwctx_destroy(struct amdxdna_hwctx *hwctx)
 	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
 
 	/*
-	 * Mark disconnected before waking waiters in aie4_unlink_cert_comp() so
-	 * the job worker observes the teardown and stops waiting on read_index.
+	 * Mark disconnected and drop the doorbell under io_lock so the job worker
+	 * observes the teardown (and stops waiting on read_index), and so a
+	 * concurrent kernel-mode submitter - which only holds hwctx_srcu, not
+	 * dev_lock - cannot pass submit_one_cmd()'s status check and then ring a
+	 * NULL doorbell while this context is torn down on the TDR/reset path.
+	 * Mirrors the serialized transition in job_timeout().  doorbell_base is a
+	 * device-level managed mapping, so just drop the pointer.
 	 */
-	priv->status = CTX_STATE_DISCONNECTED;
+	if (priv->kernel_submit) {
+		mutex_lock(&priv->io_lock);
+		priv->status = CTX_STATE_DISCONNECTED;
+		priv->doorbell_addr = NULL;
+		mutex_unlock(&priv->io_lock);
+	} else {
+		/* User-mode submission has no job worker, so io_lock is not
+		 * initialized; the lockless status store is safe here.
+		 */
+		priv->status = CTX_STATE_DISCONNECTED;
+	}
 
 	ret = aie4_msg_destroy_context(ndev, priv->hw_ctx_id);
 	if (ret)
@@ -296,8 +321,6 @@ void aie4_hwctx_destroy(struct amdxdna_hwctx *hwctx)
 
 	priv->hw_ctx_id = CTX_INVALID_ID;
 	hwctx->doorbell_offset = CTX_INVALID_DOORBELL;
-	/* doorbell_base is a device-level managed mapping; just drop the pointer. */
-	priv->doorbell_addr = NULL;
 	aie4_unlink_cert_comp(hwctx);
 }
 
@@ -875,6 +898,172 @@ static void job_abort(struct amdxdna_sched_job *job)
 	job_done(job);
 }
 
+/*
+ * Write the firmware context health report into @cmd_abo's data region so user
+ * space can read it after the command is marked timed out.  If no async report
+ * was cached for this ctx, zero the per-generation fields.  The cached report is
+ * consumed (cleared) on use.  Caller must hold io_lock, which serializes the
+ * multi-word read against the async error worker overwriting it concurrently.
+ */
+static void __aie4_fill_health_data(struct amdxdna_gem_obj *cmd_abo,
+				    struct amdxdna_hwctx *hwctx)
+{
+	const size_t min_size = offsetof(struct amdxdna_ctx_health_data, aie4.uc_info);
+	struct amdxdna_hwctx_priv *priv = hwctx->priv;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	struct amdxdna_ctx_health_data *health;
+	struct aie4_msg_app_health_report *report;
+	u32 data_total;
+
+	health = amdxdna_cmd_get_data(cmd_abo, &data_total);
+	if (!health || data_total < min_size) {
+		XDNA_WARN(xdna, "Health data buffer too small: %u min %zu",
+			  data_total, min_size);
+		return;
+	}
+
+	health->version = AMDXDNA_CTX_HEALTH_DATA_V1;
+	health->npu_gen = AMDXDNA_NPU_GEN_AIE4;
+
+	if (!priv->cached_ctx_error_valid) {
+		health->aie4.ctx_state = 0;
+		health->aie4.ctx_error_type = 0;
+		health->aie4.num_uc = 0;
+		return;
+	}
+
+	report = &priv->cached_ctx_error.app_health_report;
+	health->aie4.ctx_state = aie4_health_get_ctx_status(report);
+	health->aie4.ctx_error_type = priv->cached_ctx_error.error_type;
+	health->aie4.num_uc = 0;
+	if (data_total > min_size) {
+		u32 max_uc = (data_total - min_size) / sizeof(struct uc_health_info);
+		u32 num_uc = min_t(u32, aie4_health_get_num_uc(report),
+				   AIE4_MPNPUFW_MAX_UC_COUNT);
+
+		/*
+		 * Bound by the fixed firmware source array (report->uc_info has
+		 * AIE4_MPNPUFW_MAX_UC_COUNT entries) as well as the user buffer
+		 * capacity, so a firmware-reported count cannot drive an
+		 * out-of-bounds read of the source.
+		 */
+		num_uc = min_t(u32, num_uc, max_uc);
+		if (num_uc)
+			memcpy(health->aie4.uc_info, report->uc_info,
+			       num_uc * sizeof(struct uc_health_info));
+		health->aie4.num_uc = num_uc;
+	}
+
+	/* Consumed; further timeouts on this ctx report zeros until re-cached. */
+	priv->cached_ctx_error_valid = false;
+}
+
+static void aie4_fill_health_data(struct amdxdna_gem_obj *cmd_abo,
+				  struct amdxdna_hwctx *hwctx)
+{
+	struct amdxdna_hwctx_priv *priv = hwctx->priv;
+
+	mutex_lock(&priv->io_lock);
+	__aie4_fill_health_data(cmd_abo, hwctx);
+	mutex_unlock(&priv->io_lock);
+}
+
+/*
+ * For a timed-out command chain, identify the failing sub-command from the
+ * cached health report's runlist index, record it in error_index, and fill that
+ * sub-command's health data.  The runlist index and the report body are read
+ * under a single io_lock hold, so they cannot come from two different reports if
+ * the async error worker caches a newer one in between.
+ */
+static void aie4_fill_chain_health_data(struct amdxdna_hwctx *hwctx,
+					struct amdxdna_gem_obj *cmd_abo)
+{
+	struct amdxdna_hwctx_priv *priv = hwctx->priv;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	struct amdxdna_cmd_chain *payload;
+	struct amdxdna_gem_obj *sub_abo;
+	u32 payload_len, ccnt, i = 0;
+
+	payload = amdxdna_cmd_get_payload(cmd_abo, &payload_len);
+	if (!payload) {
+		XDNA_ERR(xdna, "No chain payload for timed-out cmd");
+		return;
+	}
+	ccnt = payload->command_count;
+	if (!ccnt || payload_len < struct_size(payload, data, ccnt))
+		return;
+
+	/*
+	 * The cached report is ctx-scoped, best-effort diagnostic data: the
+	 * runlist index only disambiguates the failing sub-command within a
+	 * chain, not which job produced the report.  With several jobs in flight
+	 * in the same ctx the report may be attached to a sibling job.  That is
+	 * acceptable because a fatal firmware error resets the whole ctx, so all
+	 * in-flight jobs fail together; only the precise fault-site labelling may
+	 * be off, and no other ctx/process is affected.
+	 */
+	mutex_lock(&priv->io_lock);
+	if (priv->cached_ctx_error_valid)
+		i = aie4_health_runlist_read_idx(&priv->cached_ctx_error.app_health_report);
+	if (i >= ccnt)
+		i = 0;
+	payload->error_index = i;
+	sub_abo = amdxdna_gem_get_obj(hwctx->client, (u32)payload->data[i], AMDXDNA_BO_SHARE);
+	if (sub_abo)
+		__aie4_fill_health_data(sub_abo, hwctx);
+	mutex_unlock(&priv->io_lock);
+
+	if (sub_abo)
+		amdxdna_gem_put_obj(sub_abo);
+	else
+		XDNA_ERR(xdna, "Failed to find sub cmd BO %u", (u32)payload->data[i]);
+}
+
+/*
+ * Reap a timed-out job during the disconnected drain.  job_worker() only routes
+ * here on the firmware-fault path (cached async health report) once the context
+ * is already DISCONNECTED - context teardown and the TDR reset both quiesce
+ * firmware via aie4_hwctx_destroy() before draining - so the device no longer
+ * touches the command BO, the umq buffers or read_index.  Attach the cached
+ * health report to the command, mark it TIMEOUT, advance read_index so waiters
+ * observe completion, and signal the fence.
+ */
+static void job_timeout(struct amdxdna_sched_job *job)
+{
+	struct amdxdna_hwctx *hwctx = job->hwctx;
+	struct amdxdna_hwctx_priv *priv = hwctx->priv;
+
+	XDNA_ERR(hwctx->client->xdna, "timing out %s job %lld", hwctx->name, job->seq);
+
+	/*
+	 * Attach the firmware health report (if one was cached for this ctx) to
+	 * the timed-out command before publishing the TIMEOUT state.  For a chain
+	 * the failing sub-command is identified and carries the report.
+	 */
+	if (amdxdna_cmd_get_op(job->cmd_bo) == ERT_CMD_CHAIN)
+		aie4_fill_chain_health_data(hwctx, job->cmd_bo);
+	else
+		aie4_fill_health_data(job->cmd_bo, hwctx);
+
+	/* Ensure health data is visible before user space observes TIMEOUT. */
+	wmb();
+	amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_TIMEOUT);
+
+	/*
+	 * Firmware is already quiesced and the context DISCONNECTED; advance
+	 * read_index under io_lock (serialized against the submit path) so any
+	 * waiter observes completion.
+	 */
+	mutex_lock(&priv->io_lock);
+	update_read_index(hwctx, job->seq + 1);
+	mutex_unlock(&priv->io_lock);
+
+	/* Wake parked submitters so they observe the disconnect and bail. */
+	wake_up_all(&priv->job_list_wq);
+
+	job_done(job);
+}
+
 static void job_worker(struct work_struct *work)
 {
 	struct amdxdna_hwctx_priv *priv =
@@ -897,7 +1086,17 @@ static void job_worker(struct work_struct *work)
 				amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_ABORT);
 			job_complete(job);
 		} else {
-			job_abort(job);
+			/*
+			 * Disconnected (firmware quiesced by destroy on the teardown or
+			 * TDR-reset path) - safe to reap.  If an async fault report was
+			 * cached, attach it and mark the command TIMEOUT; otherwise
+			 * abort.  cached_ctx_error_valid is a lockless hint;
+			 * job_timeout() -> aie4_fill_health_data() re-checks under io_lock.
+			 */
+			if (READ_ONCE(priv->cached_ctx_error_valid))
+				job_timeout(job);
+			else
+				job_abort(job);
 		}
 	}
 }
@@ -910,6 +1109,50 @@ static void aie4_hwctx_cleanup_running_jobs(struct amdxdna_hwctx *hwctx)
 	drm_WARN_ON(&hwctx->client->xdna->ddev, priv->status == CTX_STATE_CONNECTED);
 	queue_work(priv->job_work_q, &priv->job_work);
 	flush_work(&priv->job_work);
+}
+
+/*
+ * Recover a faulted context (TDR): destroy then recreate the firmware context.
+ * Destroy disconnects the ctx and wakes any cmd_wait waiters; draining the
+ * running jobs reaps the faulting command (timeout, with the cached health
+ * report) and aborts the rest, which empties the HSA queue; recreate reconnects
+ * so user space can keep submitting.  Caller holds dev_lock.
+ */
+void aie4_hwctx_reset(struct amdxdna_hwctx *hwctx)
+{
+	struct amdxdna_hwctx_priv *priv = hwctx->priv;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	int ret;
+
+	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
+	if (!priv->kernel_submit)
+		return;
+
+	aie4_hwctx_destroy(hwctx);
+	aie4_hwctx_cleanup_running_jobs(hwctx);
+
+	/*
+	 * Drop any cached fault report not consumed by the drain so it cannot be
+	 * misattributed to a command in the next context generation.
+	 */
+	mutex_lock(&priv->io_lock);
+	priv->cached_ctx_error_valid = false;
+	mutex_unlock(&priv->io_lock);
+
+	ret = aie4_hwctx_create(hwctx);
+	if (ret) {
+		XDNA_ERR(xdna, "Reset %s failed, ret %d", hwctx->name, ret);
+		/*
+		 * Recreate failed: the ctx stays DISCONNECTED.  Wake submitters
+		 * parked in aie4_cmd_submit() so they observe the disconnect and
+		 * bail instead of blocking until a fatal signal.
+		 */
+		wake_up_all(&priv->job_list_wq);
+		return;
+	}
+
+	/* Reconnected: release submitters parked while disconnected. */
+	wake_up_all(&priv->job_list_wq);
 }
 
 /*

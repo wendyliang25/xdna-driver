@@ -393,6 +393,26 @@ static void aie4_cache_ctx_error(struct amdxdna_dev_hdl *ndev,
 	mutex_unlock(&xdna->dev_lock);
 }
 
+/*
+ * Recover the faulted context (TDR): find it by firmware id and reset it
+ * (destroy + drain + recreate).  Must run after the health report has been
+ * cached so the drained timeout attaches it to the failing command.
+ */
+static void aie4_ctx_reset(struct amdxdna_dev_hdl *ndev, u32 hw_ctx_id)
+{
+	struct amdxdna_dev *xdna = ndev->aie.xdna;
+	struct amdxdna_hwctx *hwctx;
+	int idx;
+
+	mutex_lock(&xdna->dev_lock);
+	hwctx = hw_ctx_id2hwctx(ndev, hw_ctx_id, &idx);
+	if (hwctx) {
+		aie4_hwctx_reset(hwctx);
+		srcu_read_unlock(&hwctx->client->hwctx_srcu, idx);
+	}
+	mutex_unlock(&xdna->dev_lock);
+}
+
 static int aie4_error_async_cb(void *handle, void __iomem *data, size_t size)
 {
 	struct async_event *e = handle;
@@ -437,6 +457,8 @@ static void aie4_error_worker(struct work_struct *err_work)
 		XDNA_ERR(xdna, "Context error: ctx_id=%u error_type=%u",
 			 ctx_err->ctx_id, ctx_err->error_type);
 		aie4_cache_ctx_error(e->ndev, ctx_err);
+		/* Recover the context; drained timeout attaches the cached report. */
+		aie4_ctx_reset(e->ndev, ctx_err->ctx_id);
 	} else {
 		info = (struct aie_err_info *)e->buf;
 		XDNA_DBG(xdna, "Error count %d return code %d", info->err_cnt, info->ret_code);

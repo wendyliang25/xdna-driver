@@ -167,6 +167,7 @@ int aie4_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job, 
 int aie4_hwctx_valid_doorbell(struct amdxdna_client *client, u32 vm_pgoff);
 int aie4_hwctx_create(struct amdxdna_hwctx *hwctx);
 void aie4_hwctx_destroy(struct amdxdna_hwctx *hwctx);
+void aie4_hwctx_reset(struct amdxdna_hwctx *hwctx);
 
 /* aie4_sriov.c */
 #if IS_ENABLED(CONFIG_PCI_IOV)

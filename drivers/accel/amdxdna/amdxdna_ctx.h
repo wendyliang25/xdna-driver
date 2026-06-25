@@ -280,6 +280,19 @@ amdxdna_cmd_get_state(struct amdxdna_gem_obj *abo)
 	return FIELD_GET(AMDXDNA_CMD_STATE, cmd->header);
 }
 
+/* Return the whole writable data region of a cmd BO (e.g. for health data). */
+static inline void *
+amdxdna_cmd_get_data(struct amdxdna_gem_obj *abo, u32 *size)
+{
+	struct amdxdna_cmd *cmd = amdxdna_gem_vmap(abo);
+
+	if (!cmd)
+		return NULL;
+
+	*size = abo->mem.size - offsetof(struct amdxdna_cmd, data);
+	return cmd->data;
+}
+
 void *amdxdna_cmd_get_payload(struct amdxdna_gem_obj *abo, u32 *size);
 u32 amdxdna_cmd_get_cu_idx(struct amdxdna_gem_obj *abo);
 int amdxdna_cmd_set_error(struct amdxdna_gem_obj *abo,
