@@ -93,6 +93,63 @@ struct amdxdna_ctx_health {
 	u32 npu_gen;
 };
 
+/* Health data for each cert (uC) within a context. */
+struct uc_health_info {
+	u32 uc_idx;
+	u32 uc_idle_status;
+	u32 misc_status;
+	u32 fw_state;
+	u32 page_idx;
+	u32 offset;
+	u32 restore_page;
+	u32 restore_offset;
+	u32 uc_ear;
+	u32 uc_esr;
+	u32 uc_pc;
+};
+
+/* Context health data payload for aie2/aie2p. */
+struct amdxdna_ctx_health_data_aie2 {
+	u32 txn_op_idx;
+	u32 ctx_pc;
+	u32 fatal_error_type;
+	u32 fatal_error_exception_type;
+	u32 fatal_error_exception_pc;
+	u32 fatal_error_app_module;
+};
+
+/*
+ * Max per-uC health entries in amdxdna_ctx_health_data_aie4.  A fixed size (not
+ * a flexible array) is required because this struct is a union member; matches
+ * the firmware AIE4_MPNPUFW_MAX_UC_COUNT.
+ */
+#define AMDXDNA_CTX_HEALTH_MAX_UC	6
+
+/* Context health data payload for aie2ps/aie4. */
+struct amdxdna_ctx_health_data_aie4 {
+	u32 ctx_state;
+	u32 num_uc;
+	u32 ctx_error_type;
+	struct uc_health_info uc_info[AMDXDNA_CTX_HEALTH_MAX_UC];
+};
+
+/*
+ * Interpretation of the amdxdna_cmd payload when a command completes with
+ * ERT_CMD_STATE_TIMEOUT; @npu_gen selects the per-generation union member.
+ */
+struct amdxdna_ctx_health_data {
+#define AMDXDNA_CTX_HEALTH_DATA_V0	0
+#define AMDXDNA_CTX_HEALTH_DATA_V1	1
+	u32 version;
+#define AMDXDNA_NPU_GEN_AIE2		0
+#define AMDXDNA_NPU_GEN_AIE4		1
+	u32 npu_gen;
+	union {
+		struct amdxdna_ctx_health_data_aie2 aie2;
+		struct amdxdna_ctx_health_data_aie4 aie4;
+	};
+};
+
 /* Exec buffer command header format */
 #define AMDXDNA_CMD_STATE		GENMASK(3, 0)
 #define AMDXDNA_CMD_EXTRA_CU_MASK	GENMASK(11, 10)

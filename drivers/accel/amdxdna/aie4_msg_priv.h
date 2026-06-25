@@ -10,10 +10,13 @@
 #include <linux/sizes.h>
 #include <linux/types.h>
 
+#include "amdxdna_ctx.h"	/* struct uc_health_info */
+
 enum aie4_msg_opcode {
 	/* Classic/PF/VF common */
 	AIE4_MSG_OP_IDENTIFY                         = 0x10002,
 	AIE4_MSG_OP_SUSPEND                          = 0x10003,
+	AIE4_MSG_OP_ASYNC_EVENT_MSG                  = 0x10004,
 	AIE4_MSG_OP_GET_TELEMETRY                    = 0x10006,
 	AIE4_MSG_OP_SET_RUNTIME_CONFIG               = 0x10007,
 	AIE4_MSG_OP_QUERY_CERT_FIRMWARE_VERSION      = 0x1000F,
@@ -32,6 +35,7 @@ enum aie4_msg_opcode {
 	AIE4_MSG_OP_AIE_VERSION_INFO                 = 0x30007,
 	AIE4_MSG_OP_POWER_OVERRIDE                   = 0x3000B,
 	AIE4_MSG_OP_AIE_RW_ACCESS                    = 0x3000E,
+	AIE4_MSG_OP_GET_APP_HEALTH_STATUS            = 0x3000F,
 	AIE4_MSG_OP_AIE_COREDUMP                     = 0x30010,
 
 	/* System control */
@@ -43,7 +47,21 @@ enum aie4_msg_status {
 	AIE4_MSG_STATUS_SUCCESS = 0x0,
 	AIE4_MSG_STATUS_ERROR = 0x1,
 	AIE4_MSG_STATUS_NOTSUPP = 0x2,
+	AIE4_MSG_STATUS_ASYNC_EVENT_MSGS_FULL = 0x3,
 	MAX_AIE4_MSG_STATUS_CODE = 0x4,
+};
+
+/* Max amount of uCs supported by the system */
+#define AIE4_MPNPUFW_MAX_UC_COUNT	6
+
+/* The 32-bit PASID format */
+union aie4_msg_pasid {
+	u32 raw;
+	struct {
+		u32 pasid     : 20;
+		u32 rsvd      : 11;
+		u32 pasid_vld : 1;
+	} f;
 };
 
 enum aie4_msg_context_priority_band {
@@ -349,5 +367,79 @@ struct aie4_msg_calibrate_clock_req {
 struct aie4_msg_calibrate_clock_resp {
 	enum aie4_msg_status status;
 } __packed;
+
+/* Hardware context status states (AIE4_MSG_OP_GET_APP_HEALTH_STATUS). */
+enum hw_ctx_status {
+	CTX_STATUS_UNASSIGNED = 0,
+	CTX_STATUS_ERROR,
+	CTX_STATUS_IDLE,
+	CTX_STATUS_RUNNABLE,
+	CTX_STATUS_RUNNING,
+	CTX_STATUS_PREEMPTING,
+};
+
+/*
+ * App health report stored in the async/health DRAM buffer.  The union covers
+ * the layout difference between legacy FW (full u32 ctx_status/num_uc) and newer
+ * FW (16-bit bitfields plus runlist_read_idx).
+ */
+struct aie4_msg_app_health_report {
+	u32 major_version : 16;
+	u32 minor_version : 16;
+	u32 context_id;
+	union {
+		struct {
+			u32 ctx_status;
+			u32 num_uc;
+		} legacy;
+		struct {
+			u32 ctx_status : 16;
+			u32 num_uc     : 16;
+			u32 runlist_read_idx;
+		};
+	};
+	struct uc_health_info uc_info[AIE4_MPNPUFW_MAX_UC_COUNT];
+};
+
+/* The async event types returned in each async response message. */
+enum aie4_msg_async_event_type {
+	AIE4_ASYNC_EVENT_TYPE_AIE_ERROR,
+	AIE4_ASYNC_EVENT_TYPE_EXCEPTION,
+	AIE4_ASYNC_EVENT_TYPE_CTX_ERROR,
+	MAX_AIE4_ASYNC_EVENT_TYPE,
+};
+
+/* AIE4_MSG_OP_ASYNC_EVENT_MSG request (registers the async DRAM buffer). */
+struct aie4_msg_async_event_config_req {
+	u64 buff_addr;
+	union aie4_msg_pasid pasid;
+	u32 buff_size;
+};
+
+/* AIE4_MSG_OP_ASYNC_EVENT_MSG response (delivered asynchronously). */
+struct aie4_msg_async_event_config_resp {
+	enum aie4_msg_status status;
+	u32 type;
+};
+
+/* The async context error types. */
+enum aie4_msg_async_ctx_error_type {
+	AIE4_ASYNC_EVENT_CTX_ERR_HWSCH_FAILURE,
+	AIE4_ASYNC_EVENT_CTX_ERR_STOP_FAILURE,
+	AIE4_ASYNC_EVENT_CTX_ERR_AIE_FAILURE,
+	AIE4_ASYNC_EVENT_CTX_ERR_PREEMPTION_TIMEOUT,
+	AIE4_ASYNC_EVENT_CTX_ERR_NEW_PROCESS_FAILURE,
+	AIE4_ASYNC_EVENT_CTX_ERR_UC_CRITICAL_ERROR,
+	AIE4_ASYNC_EVENT_CTX_ERR_UC_COMPLETION_TIMEOUT,
+};
+
+/* The data shared on the async buffer after a context error. */
+struct aie4_async_ctx_error {
+	u32 ctx_id;
+	u32 error_type;
+	union {
+		struct aie4_msg_app_health_report app_health_report;
+	};
+};
 
 #endif /* _AIE4_MSG_PRIV_H_ */

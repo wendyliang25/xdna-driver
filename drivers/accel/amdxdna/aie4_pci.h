@@ -13,12 +13,45 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 
+#include "drm/amdxdna_accel.h"
 #include "aie.h"
 #include "amdxdna_mailbox.h"
+#include "amdxdna_error.h"
+#include "aie4_msg_priv.h"
 
 struct host_queue_packet;
 struct host_indirect_packet_data;
 struct amdxdna_hwctx;
+struct async_events;
+
+/* Health report legacy version: major 2, minor 0 (older FW). */
+#define AIE4_HEALTH_REPORT_LEGACY_MAJOR	2
+#define AIE4_HEALTH_REPORT_LEGACY_MINOR	0
+
+static inline bool
+aie4_health_report_is_legacy(struct aie4_msg_app_health_report *h)
+{
+	return h->major_version == AIE4_HEALTH_REPORT_LEGACY_MAJOR &&
+	       h->minor_version == AIE4_HEALTH_REPORT_LEGACY_MINOR;
+}
+
+static inline u32
+aie4_health_get_ctx_status(struct aie4_msg_app_health_report *h)
+{
+	return aie4_health_report_is_legacy(h) ? h->legacy.ctx_status : h->ctx_status;
+}
+
+static inline u32
+aie4_health_get_num_uc(struct aie4_msg_app_health_report *h)
+{
+	return aie4_health_report_is_legacy(h) ? h->legacy.num_uc : h->num_uc;
+}
+
+static inline u32
+aie4_health_runlist_read_idx(struct aie4_msg_app_health_report *h)
+{
+	return aie4_health_report_is_legacy(h) ? 0 : h->runlist_read_idx;
+}
 
 struct cert_comp {
 	struct amdxdna_dev_hdl          *ndev;
@@ -45,6 +78,16 @@ struct amdxdna_hwctx_priv {
 	u32                             status;
 	/* Snapshot of kernel_mode_submission for this ctx's lifetime. */
 	bool                            kernel_submit;
+
+	/*
+	 * Last CERT async context-error report for this ctx, cached by the async
+	 * error worker and consumed by the kernel-mode timeout path.  Both the
+	 * flag and the multi-word report body are protected by io_lock (cached
+	 * only for kernel-mode contexts); the flag alone is insufficient because
+	 * the worker can overwrite the body while the timeout path reads it.
+	 */
+	bool                            cached_ctx_error_valid;
+	struct aie4_async_ctx_error     cached_ctx_error;
 
 	/* Kernel-mode submission: driver fills the user HSA queue and rings
 	 * the doorbell.  umq_pkts/umq_indirect_pkts alias the user umq_bo;
@@ -105,6 +148,11 @@ struct amdxdna_dev_hdl {
 	u8				pw_mode;
 
 	struct amdxdna_drm_query_firmware_version cert_version;
+
+	/* Async error reporting (CERT/MPNPU events). */
+	struct async_events		*async_events;
+	/* Last async error, queryable from user space; protected by dev_lock. */
+	struct amdxdna_async_error	last_async_err;
 };
 
 struct aie4_msg_context_config_cert_logging;
@@ -150,6 +198,14 @@ int aie4_configure_hw_context_cert_log(struct amdxdna_dev_hdl *ndev,
 int aie4_calibrate_clock(struct amdxdna_dev_hdl *ndev);
 void aie4_msg_init(struct amdxdna_dev_hdl *ndev);
 u32 aie4_msg_pasid(struct amdxdna_client *client);
+int aie4_register_asyn_event_msg(struct amdxdna_dev_hdl *ndev, dma_addr_t addr, u32 size,
+				 void *handle, int (*cb)(void *, void __iomem *, size_t));
+
+/* aie4_error.c */
+int aie4_error_async_events_alloc(struct amdxdna_dev_hdl *ndev);
+void aie4_error_async_events_free(struct amdxdna_dev_hdl *ndev);
+int aie4_get_array_async_error(struct amdxdna_dev_hdl *ndev,
+			       struct amdxdna_drm_get_array *args);
 
 enum aie4_fw_feature {
 	AIE4_GET_COREDUMP,

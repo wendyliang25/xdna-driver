@@ -381,10 +381,23 @@ static int aie4_vf_hw_start(struct amdxdna_dev_hdl *ndev)
 	if (ret)
 		goto mailbox_fini;
 
+	ret = aie4_error_async_events_alloc(ndev);
+	if (ret)
+		goto partition_fini;
+
 	return 0;
 
+partition_fini:
+	aie4_partition_fini(ndev);
 mailbox_fini:
 	aie4_mailbox_fini(ndev);
+	/*
+	 * Free async events only after the mailbox is stopped: stopping the
+	 * channel fires the registered async callbacks, so the events and wq must
+	 * still exist here.  No-op when async_events was never published (earlier
+	 * failures jump straight to mailbox_fini).
+	 */
+	aie4_error_async_events_free(ndev);
 	return ret;
 }
 
@@ -395,7 +408,13 @@ static void aie4_vf_hw_stop(struct amdxdna_dev_hdl *ndev)
 	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
 
 	aie4_partition_fini(ndev);
+	/*
+	 * Stop the mailbox before freeing async events: stopping the channel
+	 * releases the still-registered async message and invokes its callback
+	 * (which queues onto the async wq), so the wq must still exist here.
+	 */
 	aie4_mailbox_fini(ndev);
+	aie4_error_async_events_free(ndev);
 }
 
 static int aie4_classic_hw_start(struct amdxdna_dev_hdl *ndev)
@@ -435,10 +454,23 @@ static int aie4_classic_hw_start(struct amdxdna_dev_hdl *ndev)
 	if (ret)
 		goto mbox_fini;
 
+	ret = aie4_error_async_events_alloc(ndev);
+	if (ret)
+		goto partition_fini;
+
 	return 0;
 
+partition_fini:
+	aie4_partition_fini(ndev);
 mbox_fini:
 	aie4_mailbox_fini(ndev);
+	/*
+	 * Free async events only after the mailbox is stopped: stopping the
+	 * channel fires the registered async callbacks, so the events and wq must
+	 * still exist here.  No-op when async_events was never published (earlier
+	 * failures jump straight to mbox_fini).
+	 */
+	aie4_error_async_events_free(ndev);
 fw_unload:
 	aie4_fw_unload(ndev);
 
@@ -453,7 +485,13 @@ static void aie4_classic_hw_stop(struct amdxdna_dev_hdl *ndev)
 
 	aie4_partition_fini(ndev);
 	aie4_suspend_fw(ndev);
+	/*
+	 * Stop the mailbox before freeing async events: stopping the channel
+	 * releases the still-registered async message and invokes its callback
+	 * (which queues onto the async wq), so the wq must still exist here.
+	 */
 	aie4_mailbox_fini(ndev);
+	aie4_error_async_events_free(ndev);
 	aie4_fw_unload(ndev);
 }
 
@@ -852,6 +890,9 @@ static int aie4_get_array(struct amdxdna_client *client,
 		break;
 	case DRM_AMDXDNA_HW_CONTEXT_BY_ID:
 		ret = amdxdna_query_ctx_status_by_id(&ndev->aie, client, args);
+		break;
+	case DRM_AMDXDNA_HW_LAST_ASYNC_ERR:
+		ret = aie4_get_array_async_error(ndev, args);
 		break;
 	case DRM_AMDXDNA_AIE_COREDUMP:
 		ret = amdxdna_get_coredump(&ndev->aie, client, args);
