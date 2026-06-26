@@ -41,6 +41,22 @@ namespace {
 
 io_test_parameter io_test_parameters;
 
+// Minimal RAII scope guard: runs the given callable when it goes out of scope,
+// including during exception unwinding.
+template <typename F>
+class scope_guard {
+public:
+  explicit scope_guard(F f) : m_f(std::move(f)) {}
+  ~scope_guard() { m_f(); }
+  scope_guard(const scope_guard&) = delete;
+  scope_guard& operator=(const scope_guard&) = delete;
+private:
+  F m_f;
+};
+
+template <typename F>
+scope_guard<F> finally(F f) { return scope_guard<F>(std::move(f)); }
+
 void
 io_test_parameter_init(int perf, int type, int wait, bool debug = false)
 {
@@ -342,6 +358,18 @@ io_test(device::id_type id, device* dev, int total_hwq_submit, int num_cmdlist,
 
   bool preemption_enabled = false;
   std::vector<std::pair<int, uint64_t>> pre_cntrs;
+  // Always disable force preemption on exit, even if anything below throws.
+  // The driver keeps force_preempt_enabled as a sticky device-global flag, so
+  // leaking it on through poisons every later hwctx create on this device.
+  auto preempt_guard = finally([&] {
+    if (!preemption_enabled)
+      return;
+    try {
+      force_fine_preemption(dev, false);
+    } catch (...) {
+      std::cerr << "Failed to disable force preemption during cleanup.\n";
+    }
+  });
   if (io_test_parameters.type == IO_TEST_FORCE_PREEMPTION) {
     // Enable force preemption and take snapshot of current fw counters before running any cmd.
     preemption_enabled = !force_fine_preemption(dev, true);
@@ -395,7 +423,6 @@ io_test(device::id_type id, device* dev, int total_hwq_submit, int num_cmdlist,
 
   // Verify preemption counters
   if (preemption_enabled) {
-    force_fine_preemption(dev, false);
     auto delta = get_fine_preemption_counter_delta(dev, hwctx, pre_cntrs);
     auto total_cmds = total_hwq_submit * num_cmdlist * cmds_per_list;
     auto expected_preemption_count = total_cmds * bo_set[0]->get_preemption_checkpoints();
