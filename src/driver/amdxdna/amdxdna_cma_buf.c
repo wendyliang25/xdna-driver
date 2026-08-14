@@ -6,7 +6,9 @@
 #include <linux/kernel.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
+#include <linux/io.h>
 #include <linux/kstrtox.h>
+#include <linux/of_address.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/string.h>
 #include <drm/drm_prime.h>
@@ -462,6 +464,66 @@ put_dev:
 	return ret;
 }
 
+/*
+ * amdxdna_rpu_cma_passthrough_init - DT passthrough-carveout fallback for
+ *                                    "rpu-cma"
+ * @xdna: XDNA device
+ * @mem_np: DT node carrying "memory-region" / "memory-region-names"
+ * @phandle_idx: index of the "rpu-cma" entry within "memory-region"
+ *
+ * On some platforms "rpu-cma" is not a bindable /reserved-memory node but a
+ * fixed-address passthrough carveout the remote firmware DMAs to/from --
+ * e.g. a direct-map virtualization guest whose DT exposes the region via
+ * its own reg (not /reserved-memory), so of_reserved_mem cannot resolve the
+ * carveout. Read that physical base/size straight from the DT and serve
+ * FW-visible mgmt buffers from THIS exact range (see amdxdna_mgmt_buff_alloc).
+ * Do NOT fall back to the default DMA pool: that memory may be outside the
+ * firmware's reachable window, so the FW control plane (coredump /
+ * async-error / FW-log) would silently fail.
+ *
+ * Only called after the standard reserved-memory bind has already failed,
+ * so this has no effect on native boot or PCI.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+static int amdxdna_rpu_cma_passthrough_init(struct amdxdna_dev *xdna,
+					    struct device_node *mem_np,
+					    int phandle_idx)
+{
+	struct device_node *rmem_np;
+	struct resource res;
+
+	rmem_np = of_parse_phandle(mem_np, "memory-region", phandle_idx);
+	if (!rmem_np || of_address_to_resource(rmem_np, 0, &res)) {
+		XDNA_ERR(xdna,
+			 "\"" AMDXDNA_RPU_CMA_NAME
+			 "\" has no resolvable reg; cannot serve mgmt buffers");
+		of_node_put(rmem_np);
+		return -EINVAL;
+	}
+	of_node_put(rmem_np);
+
+	xdna->rpu_cma_phys   = res.start;
+	xdna->rpu_cma_size   = resource_size(&res);
+	xdna->rpu_cma_offset = 0;
+	xdna->rpu_cma_vaddr  = devm_memremap(xdna->ddev.dev, xdna->rpu_cma_phys,
+					     xdna->rpu_cma_size, MEMREMAP_WC);
+	if (IS_ERR_OR_NULL(xdna->rpu_cma_vaddr)) {
+		XDNA_ERR(xdna,
+			 "failed to memremap rpu-cma [0x%llx +0x%zx]",
+			 (u64)xdna->rpu_cma_phys, xdna->rpu_cma_size);
+		xdna->rpu_cma_vaddr = NULL;
+		xdna->rpu_cma_size = 0;
+		return -ENOMEM;
+	}
+
+	XDNA_INFO(xdna,
+		 "\"" AMDXDNA_RPU_CMA_NAME
+		 "\" DT carveout [0x%llx +0x%zx] mapped for mgmt buffers",
+		 (u64)xdna->rpu_cma_phys, xdna->rpu_cma_size);
+	return 0;
+}
+
 /**
  * amdxdna_cma_region_init - Bind named CMA regions for the xdna device
  * @xdna: XDNA device
@@ -534,10 +596,18 @@ int amdxdna_cma_region_init(struct amdxdna_dev *xdna, struct device_node *mem_np
 			ret = of_reserved_mem_device_init_by_idx(parent_dev,
 								 mem_np, i);
 			if (ret) {
-				XDNA_ERR(xdna,
-					 "Failed to bind \"" AMDXDNA_RPU_CMA_NAME
-					 "\" (idx %d): %d", i, ret);
-				goto cleanup;
+				XDNA_INFO(xdna,
+					  "\"" AMDXDNA_RPU_CMA_NAME
+					  "\" reserved-mem bind failed (idx %d: %d); using DT passthrough carveout",
+					  i, ret);
+
+				ret = amdxdna_rpu_cma_passthrough_init(xdna, mem_np, i);
+				if (ret)
+					goto cleanup;
+
+				rpu_bound = true;
+				xdna->rpu_cma_bound = true;
+				continue;
 			}
 			XDNA_INFO(xdna, "\"" AMDXDNA_RPU_CMA_NAME
 				  "\" bound to parent (idx %d)", i);

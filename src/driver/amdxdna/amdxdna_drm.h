@@ -191,15 +191,35 @@ struct amdxdna_dev {
 	struct device			*cma_region_devs[MAX_MEM_REGIONS];
 
 	/*
-	 * True once the DT-declared "rpu-cma" reserved-memory region has
-	 * been bound to ddev.dev (see amdxdna_cma_region_init). When the
-	 * device sits on a non-PCI bus (platform/RPMsg) every FW-visible
-	 * mgmt buffer MUST come from this pool, otherwise the address
-	 * returned by dma_alloc_noncoherent() is not reachable by the
-	 * remote firmware. amdxdna_mgmt_buff_alloc() consults this flag
-	 * and refuses to allocate when it is false.
+	 * True once the DT-declared "rpu-cma" region has been made
+	 * available for FW-visible mgmt buffers -- either bound to
+	 * ddev.dev as a /reserved-memory region, or (see rpu_cma_phys
+	 * below) mapped as a passthrough-carveout fallback -- by
+	 * amdxdna_cma_region_init(). When the device sits on a non-PCI bus
+	 * (platform/RPMsg) every FW-visible mgmt buffer MUST come from this
+	 * pool, otherwise the address handed to the remote firmware is not
+	 * reachable by it. amdxdna_mgmt_buff_alloc() consults this flag and
+	 * refuses to allocate when it is false.
 	 */
 	bool				rpu_cma_bound;
+
+	/*
+	 * Passthrough-carveout rpu-cma allocator. When the of_reserved_mem
+	 * bind fails because "rpu-cma" is a fixed-address passthrough carveout
+	 * (declared via the DT node's own reg) rather than a /reserved-memory
+	 * node, we read the region's physical base/size straight from the DT
+	 * and serve FW-visible mgmt buffers from THIS exact physical range (the
+	 * address the remote firmware is told to DMA to/from), instead of the
+	 * default DMA pool (which may be outside the firmware's reachable
+	 * window). rpu_cma_vaddr is a WC mapping of the range starting at
+	 * rpu_cma_phys, rpu_cma_size bytes long; rpu_cma_offset is a simple
+	 * bump cursor. Zero size => this path is inactive (PCI / native
+	 * /reserved-memory bind).
+	 */
+	phys_addr_t			rpu_cma_phys;
+	size_t				rpu_cma_size;
+	size_t				rpu_cma_offset;
+	void __iomem			*rpu_cma_vaddr;
 
 	struct iommu_group		*group;
 	struct iommu_domain		*domain;

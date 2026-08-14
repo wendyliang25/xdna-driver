@@ -113,7 +113,40 @@ struct amdxdna_mgmt_dma_hdl *amdxdna_mgmt_buff_alloc(struct amdxdna_dev *xdna, s
 	dma_hdl->dir          = dir;
 	dma_hdl->size         = size;
 	dma_hdl->aligned_size = pow2_size;
-	dma_hdl->raw_size     = raw_size;
+
+	/*
+	 * Passthrough-carveout path: serve the buffer from the DT-declared
+	 * "rpu-cma" carveout at its fixed physical address (the address the
+	 * remote firmware is told to DMA to/from), rather than the default DMA
+	 * pool. Bump-allocate a naturally-aligned pow2 sub-window; identity DMA
+	 * (bus addr == PA, no IOMMU). raw_size/raw_vaddr/raw_dma_addr stay
+	 * unset (zeroed by kzalloc): there is no underlying DMA-API allocation
+	 * for amdxdna_mgmt_buff_free() to hand back on this path.
+	 */
+	if (xdna->rpu_cma_size) {
+		size_t base_off = ALIGN(xdna->rpu_cma_offset, pow2_size);
+
+		if (base_off + pow2_size > xdna->rpu_cma_size) {
+			XDNA_ERR(xdna,
+				 "rpu-cma exhausted: need 0x%zx at off 0x%zx of 0x%zx",
+				 pow2_size, base_off, xdna->rpu_cma_size);
+			kfree(dma_hdl);
+			return ERR_PTR(-ENOMEM);
+		}
+
+		dma_hdl->from_rpu_cma = true;
+		dma_hdl->rpu_cma_off  = base_off;
+		dma_hdl->dma_hdl      = xdna->rpu_cma_phys + base_off;
+		dma_hdl->vaddr        = (u8 __force *)xdna->rpu_cma_vaddr + base_off;
+		xdna->rpu_cma_offset  = base_off + pow2_size;
+
+		if (amdxdna_mgmt_buff_validate(xdna, dma_hdl->dma_hdl, dma_hdl->aligned_size))
+			goto free_buf;
+
+		return dma_hdl;
+	}
+
+	dma_hdl->raw_size = raw_size;
 
 	if (amdxdna_iova_enabled(xdna)) {
 		raw_vaddr = amdxdna_iommu_alloc(xdna, raw_size, &raw_dma);
@@ -200,6 +233,17 @@ int amdxdna_mgmt_buff_sync_for_device(struct amdxdna_mgmt_dma_hdl *dma_hdl,
 	if (ret)
 		return ret;
 
+	/*
+	 * rpu-cma path: buffer is a write-combining (MEMREMAP_WC) mapping of a
+	 * fixed physical carveout, identity-mapped and shared with the remote
+	 * firmware. No DMA-API sync applies; a write barrier flushes the WC
+	 * buffer so the firmware sees our writes before we ring the doorbell.
+	 */
+	if (dma_hdl->from_rpu_cma) {
+		wmb();
+		return 0;
+	}
+
 	if (amdxdna_iova_enabled(dma_hdl->xdna))
 		drm_clflush_virt_range(dma_hdl->vaddr + offset, len);
 	else
@@ -233,6 +277,16 @@ int amdxdna_mgmt_buff_sync_for_cpu(struct amdxdna_mgmt_dma_hdl *dma_hdl,
 	ret = amdxdna_mgmt_buff_resolve_len(dma_hdl, offset, size, &len);
 	if (ret)
 		return ret;
+
+	/*
+	 * rpu-cma path: WC mapping of a shared physical carveout. A read
+	 * barrier ensures the firmware's writes (already in DRAM) are observed
+	 * by subsequent CPU loads; no DMA-API invalidate applies.
+	 */
+	if (dma_hdl->from_rpu_cma) {
+		rmb();
+		return 0;
+	}
 
 	if (amdxdna_iova_enabled(dma_hdl->xdna))
 		drm_clflush_virt_range(dma_hdl->vaddr + offset, len);
@@ -269,6 +323,23 @@ void amdxdna_mgmt_buff_free(struct amdxdna_mgmt_dma_hdl *dma_hdl)
 {
 	if (!dma_hdl)
 		return;
+
+	/*
+	 * rpu-cma path: the buffer is a sub-window of the shared DT carveout
+	 * (devm_memremap'd, freed with the device), not a DMA-API allocation.
+	 * Reclaim the bump cursor only if this was the most recent allocation
+	 * (LIFO); otherwise leave the slot (safe — the carveout is sized for the
+	 * small, bounded set of concurrent mgmt buffers). Never call the DMA API.
+	 */
+	if (dma_hdl->from_rpu_cma) {
+		struct amdxdna_dev *xdna = dma_hdl->xdna;
+
+		if (xdna &&
+		    xdna->rpu_cma_offset == dma_hdl->rpu_cma_off + dma_hdl->aligned_size)
+			xdna->rpu_cma_offset = dma_hdl->rpu_cma_off;
+		kfree(dma_hdl);
+		return;
+	}
 
 	/*
 	 * Be tolerant of partially-constructed handles: amdxdna_mgmt_buff_alloc()

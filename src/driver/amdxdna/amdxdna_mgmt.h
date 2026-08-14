@@ -35,6 +35,14 @@ struct amdxdna_mgmt_dma_hdl {
 	void				*raw_vaddr;
 	dma_addr_t			raw_dma_addr;
 	size_t				raw_size;
+
+	/*
+	 * Passthrough-carveout rpu-cma path: buffer is a sub-window of the
+	 * shared DT carveout (xdna->rpu_cma_vaddr/_phys), not a DMA-API alloc.
+	 * vaddr/dma_hdl point into that mapping; free must NOT call the DMA API.
+	 */
+	bool				from_rpu_cma;
+	size_t				rpu_cma_off;   /* offset within the carveout */
 };
 
 struct amdxdna_mgmt_dma_hdl *amdxdna_mgmt_buff_alloc(struct amdxdna_dev *xdna, size_t size,
