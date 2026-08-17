@@ -471,15 +471,24 @@ put_dev:
  * @mem_np: DT node carrying "memory-region" / "memory-region-names"
  * @phandle_idx: index of the "rpu-cma" entry within "memory-region"
  *
- * On some platforms "rpu-cma" is not a bindable /reserved-memory node but a
+ * On some platforms "rpu-cma" is not a node registered with the
+ * of_reserved_mem core (i.e. not a child of /reserved-memory) but a
  * fixed-address passthrough carveout the remote firmware DMAs to/from --
- * e.g. a direct-map virtualization guest whose DT exposes the region via
- * its own reg (not /reserved-memory), so of_reserved_mem cannot resolve the
- * carveout. Read that physical base/size straight from the DT and serve
- * FW-visible mgmt buffers from THIS exact range (see amdxdna_mgmt_buff_alloc).
- * Do NOT fall back to the default DMA pool: that memory may be outside the
- * firmware's reachable window, so the FW control plane (coredump /
- * async-error / FW-log) would silently fail.
+ * e.g. a direct-map virtualization guest whose DT exposes the region as a
+ * plain node with its own reg. of_reserved_mem_device_init_by_idx() still
+ * resolves the "memory-region" phandle, but then fails to bind it because
+ * the target node is absent from the reserved-memory table.
+ *
+ * The phandle itself is perfectly valid, so we re-resolve it here with
+ * of_parse_phandle() -- a plain OF lookup with no dependency on the
+ * reserved-memory core -- purely to get the device_node back (the failed
+ * bind call above only returns an errno, not the node it looked at). We
+ * then read that node's own reg via of_address_to_resource() to get the
+ * physical base/size straight from the DT, bypassing of_reserved_mem
+ * entirely, and serve FW-visible mgmt buffers from THIS exact range (see
+ * amdxdna_mgmt_buff_alloc). Do NOT fall back to the default DMA pool: that
+ * memory may be outside the firmware's reachable window, so the FW control
+ * plane (coredump / async-error / FW-log) would silently fail.
  *
  * Only called after the standard reserved-memory bind has already failed,
  * so this has no effect on native boot or PCI.
