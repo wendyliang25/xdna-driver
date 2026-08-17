@@ -238,6 +238,9 @@ struct amdxdna_client {
 #define amdxdna_for_each_client(xdna, client)			\
 	list_for_each_entry(client, &(xdna)->client_list, node)
 
+/* Platform (device-tree) device info; PCI device infos live in amdxdna_pci_drv.h. */
+extern const struct amdxdna_dev_info dev_npu3b_info;
+
 int amdxdna_sysfs_init(struct amdxdna_dev *xdna);
 void amdxdna_sysfs_fini(struct amdxdna_dev *xdna);
 

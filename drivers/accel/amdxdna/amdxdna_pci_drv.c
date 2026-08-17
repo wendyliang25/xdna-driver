@@ -300,6 +300,13 @@ static struct pci_driver amdxdna_pci_driver = {
 	.sriov_configure = amdxdna_sriov_configure,
 };
 
+/*
+ * PCI and platform (device-tree) transports are mutually exclusive at build
+ * time (OFT_CONFIG_AMDXDNA_PCI vs OFT_CONFIG_AMDXDNA_OF), so the PCI driver owns
+ * module init/exit for the PCI build.  The OF build compiles amdxdna_platform.c
+ * instead (which owns module init/exit there) and does not build this file's
+ * PCI driver registration.
+ */
 module_pci_driver(amdxdna_pci_driver);
 
 MODULE_LICENSE("GPL");
