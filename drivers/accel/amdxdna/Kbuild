@@ -26,7 +26,6 @@ amdxdna-y := \
 	amdxdna_ctx.o \
 	amdxdna_gem.o \
 	amdxdna_iommu.o \
-	amdxdna_mailbox.o \
 	amdxdna_mailbox_helper.o \
 	amdxdna_pci_drv.o \
 	amdxdna_pm.o \
@@ -37,8 +36,11 @@ amdxdna-y := \
 	amdxdna_xen.o \
 	amdxdna_sensors.o
 
+# PCI transport: the SRAM-BAR mgmt mailbox + PCI bring-up. amdxdna_mailbox.o
+# provides the struct mailbox_channel implementation for this build.
 amdxdna-$(OFT_CONFIG_AMDXDNA_PCI) += \
 	aie.o \
+	aie4.o \
 	aie_psp.o \
 	aie_smu.o \
 	aie2_ctx.o \
@@ -52,6 +54,7 @@ amdxdna-$(OFT_CONFIG_AMDXDNA_PCI) += \
 	aie4_error.o \
 	aie4_message.o \
 	aie4_pci.o \
+	amdxdna_mailbox.o \
 	amdxdna_dpt.o \
 	amdxdna_error.o \
 	npu1_regs.o \
@@ -59,6 +62,15 @@ amdxdna-$(OFT_CONFIG_AMDXDNA_PCI) += \
 	npu4_regs.o \
 	npu5_regs.o \
 	npu6_regs.o
+
+# Platform (device-tree) transport: shmem+IPI mgmt mailbox + doorbell.
+# amdxdna_mailbox_plat.o provides its own struct mailbox_channel implementation.
+# These and the PCI transport are mutually exclusive (compile-time selection).
+amdxdna-$(OFT_CONFIG_AMDXDNA_OF) += \
+	amdxdna_platform.o \
+	amdxdna_mailbox_plat.o \
+	aie4_plat.o \
+	npu3b_regs.o
 
 amdxdna-$(CONFIG_PCI_IOV) += \
 	aie4_sriov.o
