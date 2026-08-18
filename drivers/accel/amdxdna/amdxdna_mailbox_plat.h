@@ -9,8 +9,11 @@
  * a pair of IPI mailbox channels (tx/rx) carry interrupt notifications only.
  * The IPI carries no data -- the payload is always in shared memory.
  *
- * The doorbell channel (hw_ctx dispatch notification) is implemented
- * separately in aie4_plat.c but reuses this mailbox's TX IPI channel via
+ * This is a platform implementation of the opaque struct mailbox_channel
+ * (amdxdna_mailbox.h): it defines its own channel and implements
+ * xdna_mailbox_send_msg()/stop_channel()/free_channel() so the shared
+ * aie_send_mgmt_msg_wait() path works unchanged.  The doorbell path
+ * (aie4_plat.c) reuses this mailbox's TX IPI channel via
  * amdxdna_mailbox_plat_kick().
  */
 
@@ -22,9 +25,8 @@
 #include <linux/types.h>
 
 struct amdxdna_dev;
-struct amdxdna_mailbox_plat;
+struct mailbox_channel;
 struct platform_device;
-struct xdna_mailbox_msg;
 
 /*
  * HSA-aligned ring control header for the shmem SPSC transport.  head and tail
@@ -70,21 +72,15 @@ struct shmem_msg_hdr {
 #define SHMEM_TOMBSTONE	0xDEADFACE
 
 /*
- * amdxdna_mailbox_plat_create - map the mgmt region + acquire IPI channels.
- * Returns a mailbox handle on success or an ERR_PTR on failure.  The handle is
- * drm-managed (freed with the drm device); amdxdna_mailbox_plat_destroy()
- * releases the IPI channels and pending state.
+ * amdxdna_mailbox_plat_create - map the mgmt region, acquire the IPI channels
+ * and build the mgmt mailbox channel.  Returns a struct mailbox_channel handle
+ * (drm-managed) that can be published as aie->mgmt_chann, or an ERR_PTR.
  */
-struct amdxdna_mailbox_plat *
+struct mailbox_channel *
 amdxdna_mailbox_plat_create(struct amdxdna_dev *xdna,
 			    struct platform_device *pdev);
-void amdxdna_mailbox_plat_destroy(struct amdxdna_mailbox_plat *mb);
-
-/* Send a management message (SPSC produce + IPI). */
-int amdxdna_mailbox_plat_send(struct amdxdna_mailbox_plat *mb,
-			      struct xdna_mailbox_msg *msg);
 
 /* Bare IPI kick on the shared TX channel (used by the doorbell path). */
-int amdxdna_mailbox_plat_kick(struct amdxdna_mailbox_plat *mb);
+int amdxdna_mailbox_plat_kick(struct mailbox_channel *mb_chann);
 
 #endif /* _AMDXDNA_MAILBOX_PLAT_H_ */

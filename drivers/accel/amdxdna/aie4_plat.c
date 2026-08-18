@@ -32,6 +32,7 @@
 #include "aie4.h"
 #include "aie4_pci.h"
 #include "aie4_plat.h"
+#include "amdxdna_mailbox.h"
 #include "amdxdna_mailbox_plat.h"
 #include "amdxdna_drv.h"
 
@@ -117,7 +118,7 @@ int amdxdna_ring_ctx_doorbell(struct amdxdna_dev_hdl *ndev, u32 hw_ctx_id)
 
 	/* TODO: SPSC-produce hw_ctx_id into ndev->db_ring. */
 
-	return amdxdna_mailbox_plat_kick(ndev->mbox_plat);
+	return amdxdna_mailbox_plat_kick(ndev->aie.mgmt_chann);
 }
 
 /*
@@ -155,34 +156,44 @@ void aie4_hw_resume_cleanup(struct amdxdna_dev *xdna)
 
 /*
  * Bring up the mgmt mailbox channel over the shmem+IPI transport and map the
- * doorbell region.  The shmem regions and IPI channels were acquired in
- * amdxdna_plat_probe() (amdxdna_mailbox_plat_create).
+ * doorbell region.  Builds the shmem struct mailbox_channel and publishes it as
+ * ndev->aie.mgmt_chann so the shared aie_send_mgmt_msg_wait() path reaches the
+ * shmem mailbox (amdxdna_mailbox_plat.c).
  */
 int aie4_mailbox_init(struct amdxdna_dev_hdl *ndev)
 {
 	struct amdxdna_dev *xdna = ndev->aie.xdna;
+	struct platform_device *pdev = to_platform_device(xdna->ddev.dev);
+	struct mailbox_channel *mgmt_chann;
 	int ret;
 
-	if (!ndev->mbox_plat) {
-		XDNA_ERR(xdna, "platform mailbox not created");
-		return -ENODEV;
-	}
+	mgmt_chann = amdxdna_mailbox_plat_create(xdna, pdev);
+	if (IS_ERR(mgmt_chann))
+		return PTR_ERR(mgmt_chann);
+
+	ndev->aie.mgmt_chann = mgmt_chann;
 
 	ret = aie4_plat_doorbell_init(ndev);
 	if (ret)
-		return ret;
+		goto free_chann;
 
-	/*
-	 * TODO: build the shmem struct mailbox_channel and publish it as
-	 * ndev->aie.mgmt_chann so the shared aie_send_mgmt_msg_wait() path
-	 * reaches the shmem mailbox (amdxdna_mailbox_plat.c).
-	 */
 	return 0;
+
+free_chann:
+	xdna_mailbox_stop_channel(mgmt_chann);
+	xdna_mailbox_free_channel(mgmt_chann);
+	ndev->aie.mgmt_chann = NULL;
+	return ret;
 }
 
 void aie4_mailbox_fini(struct amdxdna_dev_hdl *ndev)
 {
-	/* TODO: tear down the shmem mgmt mailbox_channel. */
+	if (!ndev->aie.mgmt_chann)
+		return;
+
+	xdna_mailbox_stop_channel(ndev->aie.mgmt_chann);
+	xdna_mailbox_free_channel(ndev->aie.mgmt_chann);
+	ndev->aie.mgmt_chann = NULL;
 }
 
 const struct amdxdna_dev_ops aie4_plat_ops = {

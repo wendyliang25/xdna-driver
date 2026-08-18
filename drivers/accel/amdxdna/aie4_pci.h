@@ -21,7 +21,6 @@
 struct host_queue_packet;
 struct host_indirect_packet_data;
 struct amdxdna_hwctx;
-struct amdxdna_mailbox_plat;
 struct shmem_db_ring;
 
 /* Default context switch hysteresis timeout in microseconds. */
@@ -158,11 +157,11 @@ struct amdxdna_dev_hdl {
 	struct amdxdna_drm_query_firmware_version cert_version;
 
 	/*
-	 * Platform (non-PCI) transport, all NULL/zero on the PCI path.  The
-	 * mgmt mailbox (shmem+IPI) and the shmem/IPI doorbell replace the PCI
-	 * SRAM-BAR mailbox and doorbell BAR respectively.  See aie4_plat.c.
+	 * Platform (non-PCI) transport, all NULL/zero on the PCI path.  The mgmt
+	 * mailbox (shmem+IPI) is published as aie.mgmt_chann like the PCI mailbox;
+	 * the shmem/IPI doorbell below replaces the PCI doorbell BAR.  See
+	 * aie4_plat.c / amdxdna_mailbox_plat.c.
 	 */
-	struct amdxdna_mailbox_plat	*mbox_plat;
 	void				*db_shmem;
 	struct shmem_db_ring		*db_ring;
 	u64				db_ring_mask;

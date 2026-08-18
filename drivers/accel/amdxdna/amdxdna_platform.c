@@ -26,12 +26,10 @@
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
 
-#include "aie4_pci.h"
 #include "aie4_plat.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_debugfs.h"
 #include "amdxdna_drv.h"
-#include "amdxdna_mailbox_plat.h"
 
 static void amdxdna_plat_drm_release(struct drm_device *drm, void *res)
 {
@@ -45,8 +43,6 @@ static int amdxdna_plat_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	const struct amdxdna_dev_info *dev_info;
-	struct amdxdna_mailbox_plat *mb;
-	struct amdxdna_dev_hdl *ndev;
 	struct amdxdna_dev *xdna;
 	struct drm_device *ddev;
 	int ret;
@@ -96,21 +92,19 @@ static int amdxdna_plat_probe(struct platform_device *pdev)
 	if (IS_ERR(xdna->notifier_wq))
 		return PTR_ERR(xdna->notifier_wq);
 
-	ndev = aie4_plat_ndev_alloc(xdna);
-	if (!ndev)
+	if (!aie4_plat_ndev_alloc(xdna))
 		return -ENOMEM;
 
-	mb = amdxdna_mailbox_plat_create(xdna, pdev);
-	if (IS_ERR(mb))
-		return PTR_ERR(mb);
-	ndev->mbox_plat = mb;
-
+	/*
+	 * ops->init() (aie4_init) runs the shared aie4 bring-up, which creates the
+	 * shmem mgmt mailbox (aie4_mailbox_init) and does the firmware handshake.
+	 */
 	mutex_lock(&xdna->dev_lock);
 	ret = xdna->dev_info->ops->init(xdna);
 	mutex_unlock(&xdna->dev_lock);
 	if (ret) {
 		XDNA_ERR(xdna, "Device init failed, ret %d", ret);
-		goto mbox_destroy;
+		return ret;
 	}
 
 	ret = amdxdna_sysfs_init(xdna);
@@ -136,15 +130,12 @@ dev_fini:
 	mutex_lock(&xdna->dev_lock);
 	xdna->dev_info->ops->fini(xdna);
 	mutex_unlock(&xdna->dev_lock);
-mbox_destroy:
-	amdxdna_mailbox_plat_destroy(mb);
 	return ret;
 }
 
 static void amdxdna_plat_remove(struct platform_device *pdev)
 {
 	struct amdxdna_dev *xdna = platform_get_drvdata(pdev);
-	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
 	struct amdxdna_client *client;
 
 	drm_dev_unplug(&xdna->ddev);
@@ -155,11 +146,10 @@ static void amdxdna_plat_remove(struct platform_device *pdev)
 	list_for_each_entry(client, &xdna->client_list, node)
 		amdxdna_hwctx_remove_all(client);
 
+	/* ops->fini (aie4_fini) tears down the shmem mgmt mailbox. */
 	xdna->dev_info->ops->fini(xdna);
 	mutex_unlock(&xdna->dev_lock);
 	mutex_unlock(&xdna->client_lock);
-
-	amdxdna_mailbox_plat_destroy(ndev->mbox_plat);
 }
 
 static const struct of_device_id amdxdna_plat_of_match[] = {
