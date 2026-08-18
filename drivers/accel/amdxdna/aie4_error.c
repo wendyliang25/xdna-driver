@@ -21,7 +21,7 @@
 #include "aie4_pci.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_error.h"
-#include "amdxdna_pci_drv.h"
+#include "amdxdna_drv.h"
 
 /*
  * The async event scaffolding, GET_ARRAY query and the generic category /

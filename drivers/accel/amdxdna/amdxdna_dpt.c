@@ -21,7 +21,7 @@
 
 #include "aie.h"
 #include "amdxdna_dpt.h"
-#include "amdxdna_pci_drv.h"
+#include "amdxdna_drv.h"
 
 static const char * const amdxdna_dpt_irq_name[AMDXDNA_DPT_KIND_MAX] = {
 	[AMDXDNA_DPT_FW_LOG]   = "xdna_fw_log",
