@@ -21,26 +21,36 @@ ccflags-y += -g -Werror
 ccflags-${UMQ_HELLO_TEST} += -DUMQ_HELLO_TEST
 
 obj-m	+= amdxdna.o
-# Only objects that have corresponding .c sources in this directory
+# Common objects, built for both the PCI and OF (device-tree) transports: the
+# DRM layer (amdxdna_drm.o), the shared aie4 core/ops (aie4.o, aie4_ctx/error/
+# message.o) and the aie message/DPT/error infrastructure.
 amdxdna-y := \
 	amdxdna_ctx.o \
+	amdxdna_drm.o \
 	amdxdna_gem.o \
 	amdxdna_iommu.o \
 	amdxdna_mailbox_helper.o \
-	amdxdna_pci_drv.o \
 	amdxdna_pm.o \
 	amdxdna_sysfs.o \
 	amdxdna_ubuf.o \
 	amdxdna_cbuf.o \
 	amdxdna_cma_buf.o \
 	amdxdna_xen.o \
-	amdxdna_sensors.o
-
-# PCI transport: the SRAM-BAR mgmt mailbox + PCI bring-up. amdxdna_mailbox.o
-# provides the struct mailbox_channel implementation for this build.
-amdxdna-$(OFT_CONFIG_AMDXDNA_PCI) += \
+	amdxdna_sensors.o \
 	aie.o \
 	aie4.o \
+	aie4_ctx.o \
+	aie4_error.o \
+	aie4_message.o \
+	amdxdna_dpt.o \
+	amdxdna_error.o
+
+# PCI transport (mutually exclusive with OF): the PCI driver, PCI bring-up
+# (PSP/SMU, SRAM-BAR mailbox), the aie2 generations and the PCI struct
+# mailbox_channel impl (amdxdna_mailbox.o).  aie4_pci.o provides the aie4
+# transport hooks.
+amdxdna-$(OFT_CONFIG_AMDXDNA_PCI) += \
+	amdxdna_pci_drv.o \
 	aie_psp.o \
 	aie_smu.o \
 	aie2_ctx.o \
@@ -50,30 +60,28 @@ amdxdna-$(OFT_CONFIG_AMDXDNA_PCI) += \
 	aie2_pm.o \
 	aie2_solver.o \
 	aie2_tdr.o \
-	aie4_ctx.o \
-	aie4_error.o \
-	aie4_message.o \
 	aie4_pci.o \
 	amdxdna_mailbox.o \
-	amdxdna_dpt.o \
-	amdxdna_error.o \
 	npu1_regs.o \
 	npu3_regs.o \
 	npu4_regs.o \
 	npu5_regs.o \
 	npu6_regs.o
 
-# Platform (device-tree) transport: shmem+IPI mgmt mailbox + doorbell.
-# amdxdna_mailbox_plat.o provides its own struct mailbox_channel implementation.
-# These and the PCI transport are mutually exclusive (compile-time selection).
+# OF (device-tree) transport (mutually exclusive with PCI): the platform driver,
+# the shmem+IPI struct mailbox_channel impl (amdxdna_mailbox_plat.o), the aie4
+# transport hooks (aie4_plat.o) and the npu3b device info.
 amdxdna-$(OFT_CONFIG_AMDXDNA_OF) += \
 	amdxdna_platform.o \
 	amdxdna_mailbox_plat.o \
 	aie4_plat.o \
 	npu3b_regs.o
 
-amdxdna-$(CONFIG_PCI_IOV) += \
-	aie4_sriov.o
+# SR-IOV is PCI-only; gate it on the PCI transport as well as CONFIG_PCI_IOV so
+# an OF build never pulls it in.
+ifeq ($(OFT_CONFIG_AMDXDNA_PCI),y)
+amdxdna-$(CONFIG_PCI_IOV) += aie4_sriov.o
+endif
 
 amdxdna-$(CONFIG_DEBUG_FS) += \
 	amdxdna_debugfs.o
