@@ -12,6 +12,13 @@
 #include <drm/drm_print.h>
 #include <drm/gpu_scheduler.h>
 #include <linux/xarray.h>
+
+/*
+ * This common translation unit owns the trace point instances (it is built for
+ * both the PCI and OF transports); PCI-only users like amdxdna_mailbox.c just
+ * include the header to emit events.
+ */
+#define CREATE_TRACE_POINTS
 #include "trace/events/amdxdna.h"
 
 #include "amdxdna_ctx.h"

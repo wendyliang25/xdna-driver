@@ -11,7 +11,7 @@
 #include <linux/slab.h>
 #include <linux/xarray.h>
 
-#define CREATE_TRACE_POINTS
+/* Trace point instances live in the common amdxdna_ctx.c; just emit here. */
 #include "trace/events/amdxdna.h"
 
 #include "amdxdna_mailbox.h"
