@@ -196,9 +196,46 @@ void aie4_mailbox_fini(struct amdxdna_dev_hdl *ndev)
 	ndev->aie.mgmt_chann = NULL;
 }
 
+/*
+ * Platform FW log/trace: run the transport-independent core (aie4.c). The SoC
+ * firmware does not report MSI info, so the DPT ring stays in polling mode
+ * (io_base NULL / msi_idx 0); no SRAM window or MSI to wire up here.
+ */
+static int aie4_plat_fw_log_init(struct amdxdna_dev *xdna, size_t size, u32 level)
+{
+	struct amdxdna_dpt *dpt = aie4_fw_log_init(xdna, size, level, NULL, NULL);
+
+	return IS_ERR(dpt) ? PTR_ERR(dpt) : 0;
+}
+
+static int aie4_plat_fw_trace_init(struct amdxdna_dev *xdna, size_t size, u32 categories)
+{
+	struct amdxdna_dpt *dpt = aie4_fw_trace_init(xdna, size, categories, NULL, NULL);
+
+	return IS_ERR(dpt) ? PTR_ERR(dpt) : 0;
+}
+
+/* Transport hook (platform): install the FW log/trace msg_ops. No VF concept. */
+void aie4_fw_msg_ops_init(struct amdxdna_dev_hdl *ndev)
+{
+	if (AIE_FEATURE_ON(&ndev->aie, AIE4_FW_LOG)) {
+		ndev->aie.msg_ops.fw_log_init   = aie4_plat_fw_log_init;
+		ndev->aie.msg_ops.fw_log_config = aie4_fw_log_config;
+		ndev->aie.msg_ops.fw_log_fini   = aie4_fw_log_fini;
+		ndev->aie.msg_ops.fw_log_parse  = aie4_fw_log_parse;
+	}
+
+	if (AIE_FEATURE_ON(&ndev->aie, AIE4_FW_TRACE)) {
+		ndev->aie.msg_ops.fw_trace_init   = aie4_plat_fw_trace_init;
+		ndev->aie.msg_ops.fw_trace_config = aie4_fw_trace_config;
+		ndev->aie.msg_ops.fw_trace_fini   = aie4_fw_trace_fini;
+	}
+}
+
 const struct amdxdna_dev_ops aie4_plat_ops = {
 	.init			= aie4_init,
 	.fini			= aie4_fini,
+	.debugfs_init		= aie4_debugfs_init,
 	.hwctx_init		= aie4_hwctx_init,
 	.hwctx_fini		= aie4_hwctx_fini,
 	.hwctx_config		= aie4_hwctx_config,

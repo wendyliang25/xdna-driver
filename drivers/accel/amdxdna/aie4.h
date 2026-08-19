@@ -17,6 +17,7 @@
 struct amdxdna_dev;
 struct amdxdna_dev_hdl;
 struct amdxdna_client;
+struct amdxdna_dpt;
 struct amdxdna_drm_get_info;
 struct amdxdna_drm_set_state;
 struct amdxdna_drm_get_array;
@@ -35,6 +36,8 @@ int aie4_hw_start_quirk(struct amdxdna_dev_hdl *ndev);	/* PCI: npu3a echo; plat:
 int aie4_hw_resume_prepare(struct amdxdna_dev *xdna);	/* PCI: pci_enable; plat: noop */
 void aie4_hw_resume_cleanup(struct amdxdna_dev *xdna);	/* PCI: pci_disable;plat: noop */
 int amdxdna_ring_ctx_doorbell(struct amdxdna_dev_hdl *ndev, u32 hw_ctx_id);
+/* Install FW log/trace msg_ops (PCI wires MSI/SRAM; plat runs polling only). */
+void aie4_fw_msg_ops_init(struct amdxdna_dev_hdl *ndev);
 
 /* Shared classic lifecycle (aie4.c) -- pointed to by classic and plat ops. */
 int aie4_hw_start(struct amdxdna_dev_hdl *ndev);
@@ -60,5 +63,25 @@ int aie4_get_info(struct amdxdna_client *client, struct amdxdna_drm_get_info *ar
 int aie4_set_state(struct amdxdna_client *client,
 		   struct amdxdna_drm_set_state *args, u32 *settle_ms);
 int aie4_get_array(struct amdxdna_client *client, struct amdxdna_drm_get_array *args);
+
+/*
+ * Transport-independent FW log/trace core (aie4.c). The *_init helpers return
+ * the DPT handle (or an ERR_PTR) so the transport wrapper can wire its MSI/
+ * io_base (PCI) or leave it polling (OF); msi_idx/msi_address may be NULL.
+ */
+struct amdxdna_dpt *aie4_fw_log_init(struct amdxdna_dev *xdna, size_t size,
+				     u32 level, u32 *msi_idx, u32 *msi_address);
+int aie4_fw_log_config(struct amdxdna_dev *xdna, u32 level);
+int aie4_fw_log_fini(struct amdxdna_dev *xdna);
+void aie4_fw_log_parse(struct amdxdna_dev *xdna, char *buf, size_t size);
+struct amdxdna_dpt *aie4_fw_trace_init(struct amdxdna_dev *xdna, size_t size,
+				       u32 categories, u32 *msi_idx, u32 *msi_address);
+int aie4_fw_trace_config(struct amdxdna_dev *xdna, u32 categories);
+int aie4_fw_trace_fini(struct amdxdna_dev *xdna);
+
+/* Shared debugfs (aie4.c): common init + individual knob adders. */
+void aie4_debugfs_init(struct amdxdna_dev *xdna);
+void aie4_debugfs_add_kernel_submit(struct amdxdna_dev *xdna);
+void aie4_debugfs_add_hysteresis(struct amdxdna_dev *xdna);
 
 #endif /* _AIE4_H_ */

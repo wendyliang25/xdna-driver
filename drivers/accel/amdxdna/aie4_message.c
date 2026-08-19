@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 
 #include "aie.h"
+#include "aie4.h"
 #include "aie4_msg_priv.h"
 #include "aie4_pci.h"
 #include "amdxdna_ctx.h"
@@ -647,21 +648,9 @@ void aie4_msg_init(struct amdxdna_dev_hdl *ndev)
 	ndev->aie.hwctx_limit = MAX_HWCTX_ID;
 
 	/*
-	 * FW logging is owned by the PF; a VF must not start its own log
-	 * channel. Leaving msg_ops.fw_log_* NULL on VF is enough to keep
-	 * amdxdna_dpt_init and the FW-log ioctls dormant on that path.
+	 * The FW log/trace msg_ops need transport-specific DPT wiring (PCI MSI +
+	 * SRAM window vs OF polling) and PF/VF gating, so they are installed by a
+	 * per-transport hook rather than here in the common path.
 	 */
-	if (AIE_FEATURE_ON(&ndev->aie, AIE4_FW_LOG) &&
-	    ndev->aie.xdna->dev_info->ops != &aie4_vf_ops) {
-		ndev->aie.msg_ops.fw_log_init   = aie4_fw_log_init;
-		ndev->aie.msg_ops.fw_log_config = aie4_fw_log_config;
-		ndev->aie.msg_ops.fw_log_fini   = aie4_fw_log_fini;
-		ndev->aie.msg_ops.fw_log_parse  = aie4_fw_log_parse;
-	}
-
-	if (AIE_FEATURE_ON(&ndev->aie, AIE4_FW_TRACE)) {
-		ndev->aie.msg_ops.fw_trace_init   = aie4_fw_trace_init;
-		ndev->aie.msg_ops.fw_trace_config = aie4_fw_trace_config;
-		ndev->aie.msg_ops.fw_trace_fini   = aie4_fw_trace_fini;
-	}
+	aie4_fw_msg_ops_init(ndev);
 }

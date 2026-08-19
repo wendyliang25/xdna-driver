@@ -1388,222 +1388,67 @@ static void aie4_classic_fini(struct amdxdna_dev *xdna)
 	aie4_free_work_buffer(xdna->dev_handle);
 }
 
-int aie4_fw_log_init(struct amdxdna_dev *xdna, size_t size, u32 level)
-{
-	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
-	struct amdxdna_dpt *dpt;
-	u32 msi_idx = 0, msi_address = 0;
-	int ret;
 
-	if (level >= AIE4_FW_LOG_LEVEL_MAX) {
-		XDNA_ERR(xdna, "Invalid firmware log level: %d", level);
-		return -EINVAL;
-	}
 
-	dpt = rcu_dereference_protected(xdna->fw_log,
-					lockdep_is_held(&xdna->dev_lock));
-	if (!dpt) {
-		XDNA_ERR(xdna, "FW log handle not allocated");
-		return -ENXIO;
-	}
 
-	ret = aie4_start_fw_log(ndev, dpt->buf, level, size, &msi_idx, &msi_address);
-	if (ret) {
-		if (ret != -EOPNOTSUPP)
-			XDNA_ERR(xdna, "Failed to start FW log: %d", ret);
-		return ret;
-	}
-
-	dpt->io_base = ndev->mbox_base;
-	dpt->msi_address = msi_address & AIE4_DPT_MSI_ADDR_MASK;
-	dpt->msi_idx = msi_idx;
-
-	return 0;
-}
-
-int aie4_fw_log_config(struct amdxdna_dev *xdna, u32 level)
-{
-	struct aie4_msg_runtime_config_fw_log_level cfg = { .log_level = level };
-
-	if (level == AIE4_FW_LOG_LEVEL_OFF || level >= AIE4_FW_LOG_LEVEL_MAX) {
-		XDNA_ERR(xdna, "Invalid firmware log level: %d", level);
-		return -EINVAL;
-	}
-
-	return aie4_set_runtime_cfg(xdna->dev_handle, AIE4_RUNTIME_CONFIG_FW_LOG_LEVEL,
-				    &cfg, sizeof(cfg));
-}
-
-int aie4_fw_log_fini(struct amdxdna_dev *xdna)
-{
-	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
-	DECLARE_AIE_MSG(aie4_msg_stop_fw_log, AIE4_MSG_OP_STOP_FW_LOG);
-	int ret;
-
-	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
-	if (ret)
-		XDNA_ERR(xdna, "Failed to stop FW log: %d", ret);
-
-	return ret;
-}
-
-/* Max bytes printed per dmesg line; firmware entries are newline-delimited
- * text, so split on '\n' and cap overly long lines at this chunk size.
+/*
+ * PCI FW log/trace: run the transport-independent core (aie4.c) then wire the
+ * DPT ring to the SRAM-BAR mbox window + MSI so the firmware interrupt lands.
  */
-#define AIE4_FW_LOG_CHUNK	800
-
-void aie4_fw_log_parse(struct amdxdna_dev *xdna, char *buffer, size_t size)
+static int aie4_pci_fw_log_init(struct amdxdna_dev *xdna, size_t size, u32 level)
 {
-	size_t offset = 0;
-
-	if (!buffer || size == 0)
-		return;
-
-	while (offset < size) {
-		const char *p = buffer + offset;
-		size_t remaining = size - offset;
-		size_t n = remaining < AIE4_FW_LOG_CHUNK ? remaining : AIE4_FW_LOG_CHUNK;
-		const char *nl = memchr(p, '\n', n);
-
-		if (nl)
-			n = (size_t)(nl - p) + 1;
-
-		XDNA_INFO(xdna, "[FW LOG] %.*s", (int)n, p);
-		offset += n;
-	}
-}
-
-int aie4_fw_trace_init(struct amdxdna_dev *xdna, size_t size, u32 categories)
-{
-	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
 	u32 msi_idx = 0, msi_address = 0;
 	struct amdxdna_dpt *dpt;
-	int ret;
 
-	dpt = rcu_dereference_protected(xdna->fw_trace,
-					lockdep_is_held(&xdna->dev_lock));
-	if (!dpt) {
-		XDNA_ERR(xdna, "FW trace handle not allocated");
-		return -ENXIO;
-	}
+	dpt = aie4_fw_log_init(xdna, size, level, &msi_idx, &msi_address);
+	if (IS_ERR(dpt))
+		return PTR_ERR(dpt);
 
-	ret = aie4_start_fw_trace(ndev, dpt->buf, size, categories, &msi_idx,
-				  &msi_address);
-	if (ret) {
-		if (ret != -EOPNOTSUPP)
-			XDNA_ERR(xdna, "Failed to start FW trace: %d", ret);
-		return ret;
-	}
-
-	dpt->io_base = ndev->mbox_base;
+	dpt->io_base = xdna->dev_handle->mbox_base;
 	dpt->msi_address = msi_address & AIE4_DPT_MSI_ADDR_MASK;
 	dpt->msi_idx = msi_idx;
 
 	return 0;
 }
 
-int aie4_fw_trace_config(struct amdxdna_dev *xdna, u32 categories)
+static int aie4_pci_fw_trace_init(struct amdxdna_dev *xdna, size_t size, u32 categories)
 {
-	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
-	DECLARE_AIE_MSG(aie4_msg_set_fw_trace_categories,
-			AIE4_MSG_OP_SET_FW_TRACE_CATEGORIES);
-	int ret;
+	u32 msi_idx = 0, msi_address = 0;
+	struct amdxdna_dpt *dpt;
 
-	req.categories = categories;
+	dpt = aie4_fw_trace_init(xdna, size, categories, &msi_idx, &msi_address);
+	if (IS_ERR(dpt))
+		return PTR_ERR(dpt);
 
-	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
-	if (ret)
-		XDNA_ERR(xdna,
-			 "Set FW trace categories failed, ret %d status 0x%x",
-			 ret, resp.status);
-	return ret;
-}
-
-int aie4_fw_trace_fini(struct amdxdna_dev *xdna)
-{
-	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
-	DECLARE_AIE_MSG(aie4_msg_stop_fw_trace, AIE4_MSG_OP_STOP_FW_TRACE);
-	int ret;
-
-	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
-	if (ret)
-		XDNA_ERR(xdna, "Failed to stop FW trace: %d", ret);
-
-	return ret;
-}
-
-
-
-static int aie4_ctx_hysteresis_get(void *data, u64 *val)
-{
-	struct amdxdna_dev_hdl *ndev = data;
-	struct amdxdna_dev *xdna = ndev->aie.xdna;
-
-	guard(mutex)(&xdna->dev_lock);
-	*val = ndev->ctx_switch_hysteresis_us;
+	dpt->io_base = xdna->dev_handle->mbox_base;
+	dpt->msi_address = msi_address & AIE4_DPT_MSI_ADDR_MASK;
+	dpt->msi_idx = msi_idx;
 
 	return 0;
 }
 
-static int aie4_ctx_hysteresis_set(void *data, u64 val)
+/*
+ * Transport hook (PCI): install the FW log/trace msg_ops. FW logging is owned
+ * by the PF; a VF must not start its own log channel, so leave its fw_log_*
+ * NULL to keep amdxdna_dpt_init and the FW-log ioctls dormant on that path.
+ */
+void aie4_fw_msg_ops_init(struct amdxdna_dev_hdl *ndev)
 {
-	struct amdxdna_dev_hdl *ndev = data;
 	struct amdxdna_dev *xdna = ndev->aie.xdna;
-	int ret, idx;
 
-	if (val > U32_MAX)
-		return -EINVAL;
+	if (AIE_FEATURE_ON(&ndev->aie, AIE4_FW_LOG) &&
+	    xdna->dev_info->ops != &aie4_vf_ops) {
+		ndev->aie.msg_ops.fw_log_init   = aie4_pci_fw_log_init;
+		ndev->aie.msg_ops.fw_log_config = aie4_fw_log_config;
+		ndev->aie.msg_ops.fw_log_fini   = aie4_fw_log_fini;
+		ndev->aie.msg_ops.fw_log_parse  = aie4_fw_log_parse;
+	}
 
-	if (!drm_dev_enter(&xdna->ddev, &idx))
-		return -ENODEV;
-
-	mutex_lock(&xdna->dev_lock);
-
-	ret = amdxdna_pm_resume_get_locked(xdna);
-	if (ret)
-		goto unlock;
-
-	ret = aie4_set_ctx_hysteresis(ndev, (u32)val);
-	if (!ret)
-		ndev->ctx_switch_hysteresis_us = (u32)val;
-
-	amdxdna_pm_suspend_put(xdna);
-
-unlock:
-	mutex_unlock(&xdna->dev_lock);
-	drm_dev_exit(idx);
-
-	return ret;
-}
-
-/* Context switch hysteresis timeout in microseconds; 0 disables hysteresis. */
-DEFINE_DEBUGFS_ATTRIBUTE(aie4_ctx_hysteresis_fops, aie4_ctx_hysteresis_get,
-			 aie4_ctx_hysteresis_set, "%llu\n");
-
-static void aie4_debugfs_init(struct amdxdna_dev *xdna)
-{
-	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
-
-	/*
-	 * Submission mode only applies where the driver runs hw contexts (the
-	 * VF and classic paths); the SR-IOV PF has no submission path, so do
-	 * not expose the knob there.
-	 * 0 - submit by user space, 1 - submit by driver (default).
-	 */
-	if (xdna->dev_info->ops != &aie4_pf_ops)
-		debugfs_create_bool("kernel_mode_submission", 0600,
-				    xdna->ddev.accel->debugfs_root,
-				    &ndev->kernel_submit);
-
-	/*
-	 * Context switch hysteresis is a system-control runtime config that is
-	 * only programmed on the PF/classic hw start paths, never on a VF.
-	 * Only expose the knob where the driver actually applies it.
-	 */
-	if (!to_pci_dev(xdna->ddev.dev)->is_virtfn)
-		debugfs_create_file_unsafe("ctx_switch_hysteresis_us", 0600,
-					   xdna->ddev.accel->debugfs_root, ndev,
-					   &aie4_ctx_hysteresis_fops);
+	if (AIE_FEATURE_ON(&ndev->aie, AIE4_FW_TRACE)) {
+		ndev->aie.msg_ops.fw_trace_init   = aie4_pci_fw_trace_init;
+		ndev->aie.msg_ops.fw_trace_config = aie4_fw_trace_config;
+		ndev->aie.msg_ops.fw_trace_fini   = aie4_fw_trace_fini;
+	}
 }
 
 const struct amdxdna_dev_ops aie4_pf_ops = {
