@@ -80,6 +80,8 @@ build_module() {
     "module cross toolchain (run: bitbake amdxdna -c prepare_recipe_sysroot)"
 
   # Cross toolchain on PATH; split source/output kernel via KBUILD_OUTPUT.
+  # (We never modify the shared kernel-build-artifacts; it is expected to be
+  # already prepared for external modules by the Yocto kernel build.)
   export PATH="${MOD_NATIVE}/usr/bin/aarch64-amd-linux:${PATH}"
   export KBUILD_OUTPUT="${KART}"
 
@@ -109,6 +111,29 @@ build_module() {
     ARCH=arm64 CROSS_COMPILE="${CROSS_PREFIX}" KERNEL_SRC="${KSRC}" \
       OUT="${drvdir}/config_kernel.h" \
       sh "${SRC_ROOT}/drivers/accel/tools/configure_kernel.sh"
+
+    # aie.c calls hmm_range_fault() unconditionally, but that symbol only
+    # exists when the kernel is built with CONFIG_HMM_MIRROR (mm/hmm.c).  When
+    # the kernel lacks it, provide a weak fake in the (generated, mirror-only)
+    # config_kernel.h so the module still links; the userptr/HMM fault path
+    # then returns an error instead of resolving pages.  Source tree untouched.
+    if ! grep -q '^CONFIG_HMM_MIRROR=y' "${KART}/.config" 2>/dev/null; then
+      log "kernel has no CONFIG_HMM_MIRROR; adding fake hmm_range_fault to config_kernel.h"
+      cat >> "${drvdir}/config_kernel.h" <<'EOF'
+
+/* Kernel built without CONFIG_HMM_MIRROR: hmm_range_fault is not compiled/
+ * exported.  Provide a weak stub so amdxdna links (HMM fault path no-ops). */
+#ifndef CONFIG_HMM_MIRROR
+#include <linux/errno.h>
+struct hmm_range;
+long hmm_range_fault(struct hmm_range *range);
+__attribute__((weak)) long hmm_range_fault(struct hmm_range *range)
+{
+	return -EOPNOTSUPP;
+}
+#endif /* CONFIG_HMM_MIRROR */
+EOF
+    fi
   fi
 
   # Build in-place in the mirror via the driver Makefile's `modules` target
