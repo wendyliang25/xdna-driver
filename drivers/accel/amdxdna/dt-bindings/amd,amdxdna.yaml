@@ -73,6 +73,21 @@ properties:
       SMMU stream ID for this device's own DMA -- the AIE/CERT path used by the
       "aie<N>" pools.  Present when the SMMU is enabled.
 
+  amd,fw-dma-master:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      Optional phandle to the DMA master -- the firmware processor (e.g. an xlnx
+      r5f core) -- that accesses the "fw" pool.  Those buffers are dereferenced
+      by that master rather than by this device's own AIE/CERT data path, so the
+      driver maps the pool using the master's DMA context: its IOMMU stream ID
+      and addressing mask, which the DMA API derives from the master's device.
+      This names the initiating master; it is not a bus address translation
+      (dma-ranges), which is a property of a bus, not of this device.  Required
+      only when that master is behind an IOMMU with its own stream ID.  When it
+      addresses physical DRAM directly (or under Xen dom0less passthrough, where
+      the guest has no firmware-processor node), omit it and place the "fw"
+      reserved-memory below 4 GB instead.
+
 required:
   - compatible
   - mboxes
@@ -144,6 +159,15 @@ examples:
         #iommu-cells = <1>;
     };
 
+    /*
+     * Firmware processor core node (e.g. an xlnx r5f core) -- the DMA master for
+     * the "fw" pool. Referenced only when it is behind the SMMU with its own
+     * stream ID. Shown minimally here; see e.g. xlnx,zynqmp-r5fss.yaml.
+     */
+    fw_core: remoteproc {
+        iommus = <&smmu 0x3>;
+    };
+
     /* amdxdna platform (shared-memory + IPI) transport node */
     amdxdna: amdxdna {
         compatible = "amd,amdxdna";
@@ -153,4 +177,6 @@ examples:
         iommus = <&smmu 0x2>;
         memory-region = <&mgmt_shmem>, <&doorbell_shmem>, <&rpu_cma>, <&aie_cma0>;
         memory-region-names = "mgmt", "doorbell", "fw", "aie0";
+        /* firmware DMA master (its IOMMU stream ID + mask) for the "fw" pool */
+        amd,fw-dma-master = <&fw_core>;
     };
