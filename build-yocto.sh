@@ -79,11 +79,40 @@ build_module() {
   need_dir "$MOD_NATIVE/usr/bin/aarch64-amd-linux" \
     "module cross toolchain (run: bitbake amdxdna -c prepare_recipe_sysroot)"
 
+  # Choose KBUILD_OUTPUT carefully to avoid a vermagic mismatch.
+  #
+  # The shared kernel-build-artifacts ($KART) can carry a spurious '+' in its
+  # kernel release (e.g. '6.18.10-xilinx+'). This is a Yocto do_shared_workdir
+  # quirk: it regenerates utsrelease.h without the kernel's .scmversion, so
+  # scripts/setlocalversion appends '+' for an untagged tree. A module built
+  # against it gets vermagic '6.18.10-xilinx+', which the deployed kernel
+  # ('6.18.10-xilinx') rejects at insmod:
+  #   version magic '...-xilinx+ ...' should be '...-xilinx ...'
+  #
+  # The linux-xlnx recipe's own standard-build dir has the CORRECT (no '+')
+  # utsrelease.h -- it is the exact build that produced the deployed Image --
+  # plus a matching Module.symvers. Prefer it; fall back to $KART otherwise.
+  local KREC KOUT KREL
+  KREC="$(ls -d ${TMP}/work/amd_cortexa78_mali_common-amd-linux/linux-xlnx/*/linux-*-standard-build 2>/dev/null | head -1)"
+  if [ -n "${KREC}" ] && [ -f "${KREC}/include/generated/utsrelease.h" ] \
+     && [ -f "${KREC}/Module.symvers" ]; then
+    KOUT="${KREC}"
+    log "KBUILD_OUTPUT = linux-xlnx recipe build dir (matches deployed Image)"
+  else
+    KOUT="${KART}"
+    warn "recipe kernel build dir not found; falling back to shared artifacts:"
+    warn "  ${KART}"
+    warn "  module vermagic may get a spurious '+'; if insmod complains, rebuild"
+    warn "  the kernel (bitbake virtual/kernel) and re-run this script."
+  fi
+  KREL="$(cat "${KOUT}/include/config/kernel.release" 2>/dev/null || true)"
+  log "target kernel release (expected vermagic): ${KREL:-unknown}"
+
   # Cross toolchain on PATH; split source/output kernel via KBUILD_OUTPUT.
-  # (We never modify the shared kernel-build-artifacts; it is expected to be
-  # already prepared for external modules by the Yocto kernel build.)
+  # (We never modify the kernel build dir; it is already prepared for external
+  # module builds by the Yocto kernel build.)
   export PATH="${MOD_NATIVE}/usr/bin/aarch64-amd-linux:${PATH}"
-  export KBUILD_OUTPUT="${KART}"
+  export KBUILD_OUTPUT="${KOUT}"
 
   # Build entirely out-of-source: mirror the driver + include/ into
   # build-yocto/kmod and build there, so the source tree
@@ -117,7 +146,7 @@ build_module() {
     # the kernel lacks it, provide a weak fake in the (generated, mirror-only)
     # config_kernel.h so the module still links; the userptr/HMM fault path
     # then returns an error instead of resolving pages.  Source tree untouched.
-    if ! grep -q '^CONFIG_HMM_MIRROR=y' "${KART}/.config" 2>/dev/null; then
+    if ! grep -q '^CONFIG_HMM_MIRROR=y' "${KOUT}/.config" 2>/dev/null; then
       log "kernel has no CONFIG_HMM_MIRROR; adding fake hmm_range_fault to config_kernel.h"
       cat >> "${drvdir}/config_kernel.h" <<'EOF'
 
@@ -152,6 +181,19 @@ EOF
   mkdir -p "${OUT_DIR}"
   cp -f "$ko" "${OUT_DIR}/amdxdna.ko"
   log "amdxdna.ko -> ${OUT_DIR}/amdxdna.ko"
+
+  # Sanity check: the module's vermagic release must equal the target kernel
+  # release, or insmod will reject it on the board.
+  if command -v modinfo >/dev/null 2>&1; then
+    local vm
+    vm="$(modinfo -F vermagic "${OUT_DIR}/amdxdna.ko" 2>/dev/null | awk '{print $1}')"
+    if [ -n "${vm}" ] && [ -n "${KREL}" ] && [ "${vm}" != "${KREL}" ]; then
+      warn "vermagic mismatch: module '${vm}' vs kernel '${KREL}'"
+      warn "  the .ko will NOT load on a '${KREL}' kernel."
+    else
+      log "vermagic OK: ${vm:-unknown} (matches kernel ${KREL:-unknown})"
+    fi
+  fi
   unset KBUILD_OUTPUT
 }
 
