@@ -17,6 +17,7 @@
 #include <linux/uaccess.h>
 
 #include "aie.h"
+#include "amdxdna_cbuf.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_gem.h"
 #include "amdxdna_mailbox_helper.h"
@@ -252,7 +253,8 @@ int amdxdna_get_aie_status(struct aie_device *aie,
 	if (!alloc_sz)
 		return -EINVAL;
 
-	buf_hdl = amdxdna_alloc_msg_buff(xdna, alloc_sz);
+	/* Column dump: written by AIE shim DMA, not the firmware processor. */
+	buf_hdl = amdxdna_alloc_msg_buff(xdna, alloc_sz, false);
 	if (IS_ERR(buf_hdl))
 		return PTR_ERR(buf_hdl);
 
@@ -704,7 +706,8 @@ int amdxdna_get_frame_boundary_preempt_state(struct aie_device *aie,
 	return 0;
 }
 
-struct amdxdna_msg_buf_hdl *amdxdna_alloc_msg_buff(struct amdxdna_dev *xdna, u32 size)
+struct amdxdna_msg_buf_hdl *amdxdna_alloc_msg_buff(struct amdxdna_dev *xdna, u32 size,
+						   bool fw)
 {
 	struct amdxdna_msg_buf_hdl *hdl;
 	int order;
@@ -725,11 +728,18 @@ struct amdxdna_msg_buf_hdl *amdxdna_alloc_msg_buff(struct amdxdna_dev *xdna, u32
 		if (IS_ERR(hdl->vaddr))
 			goto free_hdl;
 	} else {
-		hdl->vaddr = dma_alloc_noncoherent(xdna->ddev.dev, hdl->size,
-						   &hdl->dma_addr,
-						   DMA_FROM_DEVICE, GFP_KERNEL);
-		if (!hdl->vaddr)
+		/*
+		 * Non-IOMMU (OF platform): allocate from the firmware or first app
+		 * bank per @fw, else the debugfs carveout, else system-default CMA.
+		 * amdxdna_cbuf_kalloc() walks that fallback chain and returns a
+		 * cookie stored in the handle for freeing.
+		 */
+		hdl->cbuf = amdxdna_cbuf_kalloc(xdna, hdl->size, fw, DMA_FROM_DEVICE,
+						&hdl->vaddr, &hdl->dma_addr);
+		if (IS_ERR(hdl->cbuf)) {
+			hdl->cbuf = NULL;
 			goto free_hdl;
+		}
 	}
 
 	return hdl;
@@ -744,14 +754,10 @@ void amdxdna_free_msg_buff(struct amdxdna_msg_buf_hdl *hdl)
 	if (!hdl)
 		return;
 
-	if (amdxdna_iova_on(hdl->xdna)) {
-		amdxdna_iommu_free(hdl->xdna, hdl->size, hdl->vaddr,
-				   hdl->dma_addr);
-	} else {
-		dma_free_noncoherent(hdl->xdna->ddev.dev, hdl->size,
-				     hdl->vaddr, hdl->dma_addr,
-				     DMA_FROM_DEVICE);
-	}
+	if (hdl->cbuf)
+		amdxdna_cbuf_kfree(hdl->cbuf);
+	else
+		amdxdna_iommu_free(hdl->xdna, hdl->size, hdl->vaddr, hdl->dma_addr);
 
 	kfree(hdl);
 }
@@ -811,7 +817,8 @@ char *amdxdna_get_hwctx_coredump(struct aie_device *aie, struct amdxdna_hwctx *h
 		return ERR_PTR(-ENOMEM);
 
 	num_bufs = total_size / coredump_data_chunk_size;
-	list_hdl = amdxdna_alloc_msg_buff(xdna, num_bufs * sizeof(*buf_list));
+	/* Coredump list + chunks: written by AIE shim DMA, not the firmware. */
+	list_hdl = amdxdna_alloc_msg_buff(xdna, num_bufs * sizeof(*buf_list), false);
 	if (IS_ERR(list_hdl)) {
 		ret = PTR_ERR(list_hdl);
 		list_hdl = NULL;
@@ -829,7 +836,7 @@ char *amdxdna_get_hwctx_coredump(struct aie_device *aie, struct amdxdna_hwctx *h
 	}
 
 	for (i = 0; i < num_bufs; i++) {
-		data_hdls[i] = amdxdna_alloc_msg_buff(xdna, coredump_data_chunk_size);
+		data_hdls[i] = amdxdna_alloc_msg_buff(xdna, coredump_data_chunk_size, false);
 		if (IS_ERR(data_hdls[i])) {
 			ret = PTR_ERR(data_hdls[i]);
 			data_hdls[i] = NULL;
@@ -1010,7 +1017,8 @@ static int amdxdna_aie_tile_read_mem(struct amdxdna_hwctx *hwctx,
 	struct amdxdna_msg_buf_hdl *dma_hdl;
 	int ret;
 
-	dma_hdl = amdxdna_alloc_msg_buff(xdna, wa->access->size);
+	/* Tile memory: written by AIE shim DMA, not the firmware processor. */
+	dma_hdl = amdxdna_alloc_msg_buff(xdna, wa->access->size, false);
 	if (IS_ERR(dma_hdl)) {
 		XDNA_ERR(xdna, "Failed to allocate DMA buffer, ret %ld",
 			 PTR_ERR(dma_hdl));
@@ -1193,7 +1201,8 @@ static int amdxdna_aie_tile_write_mem(struct amdxdna_hwctx *hwctx,
 	struct amdxdna_msg_buf_hdl *dma_hdl;
 	int ret;
 
-	dma_hdl = amdxdna_alloc_msg_buff(xdna, wa->access->size);
+	/* Tile memory: read by AIE shim DMA, not the firmware processor. */
+	dma_hdl = amdxdna_alloc_msg_buff(xdna, wa->access->size, false);
 	if (IS_ERR(dma_hdl)) {
 		XDNA_ERR(xdna, "Failed to allocate DMA buffer, ret %ld",
 			 PTR_ERR(dma_hdl));

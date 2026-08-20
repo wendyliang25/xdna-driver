@@ -409,7 +409,8 @@ int amdxdna_async_events_alloc(struct aie_device *aie,
 	for (i = 0; i < events->event_cnt; i++) {
 		struct amdxdna_async_event *e = &events->event[i];
 
-		e->hdl = amdxdna_alloc_msg_buff(xdna, ASYNC_BUF_SIZE);
+		/* Async event ring: written by the firmware processor. */
+		e->hdl = amdxdna_alloc_msg_buff(xdna, ASYNC_BUF_SIZE, true);
 		if (IS_ERR(e->hdl)) {
 			ret = PTR_ERR(e->hdl);
 			e->hdl = NULL;

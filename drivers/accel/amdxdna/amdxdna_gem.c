@@ -912,7 +912,7 @@ amdxdna_gem_create_cbuf_object(struct drm_device *dev, struct amdxdna_drm_create
 	}
 
 	align = (args->type == AMDXDNA_BO_DEV_HEAP) ?  xdna->dev_info->dev_mem_size : 0;
-	dma_buf = amdxdna_get_cbuf(dev, size, align);
+	dma_buf = amdxdna_get_cbuf(dev, size, align, args->flags);
 	if (IS_ERR(dma_buf))
 		return ERR_CAST(dma_buf);
 
@@ -1148,8 +1148,18 @@ int amdxdna_drm_create_bo_ioctl(struct drm_device *dev, void *data, struct drm_f
 	struct amdxdna_gem_obj *abo;
 	int ret = 0;
 
-	if (args->flags)
+	/*
+	 * On the OF platform bits [7:0] of flags select a memory bank by id (bit
+	 * N -> bank N), including the firmware-visible rpu bank; 0 lets the driver
+	 * pick the first AIE bank. Other bits, and any flags when no DT banks are
+	 * present, are reserved (MBZ).
+	 */
+	if (amdxdna_mem_banks_present(xdna)) {
+		if (args->flags & ~0xFFULL)
+			return -EINVAL;
+	} else if (args->flags) {
 		return -EINVAL;
+	}
 
 	XDNA_DBG(xdna, "BO arg type %d vaddr 0x%llx size 0x%llx flags 0x%llx",
 		 args->type, args->vaddr, args->size, args->flags);

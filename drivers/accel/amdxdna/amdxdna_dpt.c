@@ -546,7 +546,8 @@ amdxdna_dpt_publish(struct aie_device *aie, enum amdxdna_dpt_kind kind,
 	dpt->status = AMDXDNA_DPT_INACTIVE;
 	dpt->config = config;
 
-	hdl = amdxdna_alloc_msg_buff(xdna, buf_size);
+	/* FW log/trace ring: written by the firmware processor. */
+	hdl = amdxdna_alloc_msg_buff(xdna, buf_size, true);
 	if (IS_ERR(hdl)) {
 		ret = PTR_ERR(hdl);
 		XDNA_DPT_ERR(dpt, "Failed to allocate buffer: %d", ret);
