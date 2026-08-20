@@ -516,7 +516,8 @@ int aie2_query_telemetry(struct amdxdna_dev_hdl *ndev,
 	if (header->type >= MAX_TELEMETRY_TYPE)
 		return -EINVAL;
 
-	buf_hdl = amdxdna_alloc_msg_buff(xdna, min(size, SZ_4M));
+	/* Telemetry: consumed by CERT, not the firmware processor. */
+	buf_hdl = amdxdna_alloc_msg_buff(xdna, min(size, SZ_4M), false);
 	if (IS_ERR(buf_hdl))
 		return PTR_ERR(buf_hdl);
 
@@ -1280,7 +1281,8 @@ int aie2_query_app_health(struct amdxdna_dev_hdl *ndev, u32 context_id,
 		return -EOPNOTSUPP;
 	}
 
-	buf_hdl = amdxdna_alloc_msg_buff(xdna, sizeof(*report));
+	/* App health: consumed by CERT, not the firmware processor. */
+	buf_hdl = amdxdna_alloc_msg_buff(xdna, sizeof(*report), false);
 	if (IS_ERR(buf_hdl)) {
 		XDNA_ERR(xdna, "Failed to allocate buffer for app health");
 		return PTR_ERR(buf_hdl);

@@ -247,9 +247,24 @@ struct amdxdna_drm_va_tbl {
 	struct amdxdna_drm_va_entry va_entries[];
 };
 
+/*
+ * Fixed memory bank ids (create_bo flags bits). The id -> bank mapping is a
+ * contract between the driver and userspace; the device tree names the pools in
+ * memory-region-names ("fw", "aie<N>") and the driver maps them to these ids
+ * (fw -> 0, aie<N> -> N + 1).
+ */
+#define AMDXDNA_MEM_BANK_FW	0	/* firmware-visible (rpu) bank */
+#define AMDXDNA_MEM_BANK_AIE	1	/* first AIE/CERT app bank */
+
 /**
  * struct amdxdna_drm_create_bo - Create a buffer object.
- * @flags: Buffer flags. MBZ.
+ * @flags: Buffer flags. On the device-tree (OF) platform, bits [7:0] are a
+ *         memory-bank-id bitmap: bit N selects bank id N. AMDXDNA_MEM_BANK_FW
+ *         (0) is the firmware-visible bank (for buffers the RPU firmware
+ *         reads/writes, e.g. debug/log BOs); ids >= 1 (AMDXDNA_MEM_BANK_AIE ..)
+ *         are AIE/CERT app banks. When zero the driver picks the first app bank.
+ *         All other bits are reserved (MBZ), and on platforms without DT memory
+ *         banks the whole field is MBZ.
  * @vaddr: User VA of buffer if applied. MBZ.
  * @size: Size in bytes.
  * @type: Buffer type.

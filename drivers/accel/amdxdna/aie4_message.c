@@ -386,9 +386,11 @@ static int aie4_query_telemetry(struct aie_device *aie, char __user *buf, u32 si
 	if (header->type >= AIE4_TELEMETRY_TYPE_MAX)
 		return -EINVAL;
 
+	/* Telemetry: consumed by CERT, not the firmware processor. */
 	buf_hdl = amdxdna_alloc_msg_buff(xdna,
 					 clamp_t(u32, size,
-						 AIE4_MIN_TELEMETRY_BUFF_SIZE, SZ_4M));
+						 AIE4_MIN_TELEMETRY_BUFF_SIZE, SZ_4M),
+					 false);
 	if (IS_ERR(buf_hdl))
 		return PTR_ERR(buf_hdl);
 
