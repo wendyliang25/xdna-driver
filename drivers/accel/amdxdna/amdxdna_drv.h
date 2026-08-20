@@ -54,6 +54,9 @@
 
 extern const struct drm_driver amdxdna_drm_drv;
 
+/* Max number of AIE/CERT contiguous DRAM banks on the OF platform. */
+#define MAX_MEM_REGIONS			8
+
 struct amdxdna_client;
 struct amdxdna_dev;
 struct amdxdna_dev_hdl;
@@ -145,6 +148,7 @@ struct amdxdna_dev_info {
 };
 
 struct amdxdna_carveout;
+struct amdxdna_mem_bank;
 struct amdxdna_dpt;
 struct amdxdna_dpt_desc;
 struct aie_device;
@@ -196,6 +200,17 @@ struct amdxdna_dev {
 	const char			*vbnv;
 
 	struct amdxdna_carveout		*carveout;
+
+	/*
+	 * Multi-bank contiguous DRAM for the OF platform, keyed by the fixed,
+	 * userspace-facing bank id (create-BO flags bit N -> bank id N). Bank id
+	 * AMDXDNA_MEM_BANK_FW (0) is the firmware-visible bank; ids >= 1 are
+	 * AIE/CERT app banks. Memory comes from amdxdna's own reserved-memory,
+	 * DMA-mapped through this device. The firmware bank's 32-bit reachability
+	 * comes from its reserved-memory region being placed below 4 GB. See
+	 * amdxdna_cbuf.c.
+	 */
+	struct xarray			banks;
 
 	/* Firmware Debug/Profile/Trace (DPT) framework. Each channel owns the
 	 * SRCU domain guarding its own handle; on disable we synchronize_srcu

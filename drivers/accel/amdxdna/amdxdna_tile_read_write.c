@@ -63,7 +63,8 @@ static int amdxdna_aie_tile_read_mem(struct amdxdna_hwctx *hwctx,
 	struct amdxdna_msg_buf_hdl *dma_hdl;
 	int ret;
 
-	dma_hdl = amdxdna_alloc_msg_buff(xdna, wa->access->size);
+	/* Tile memory: written by AIE shim DMA, not the firmware processor. */
+	dma_hdl = amdxdna_alloc_msg_buff(xdna, wa->access->size, false);
 	if (IS_ERR(dma_hdl)) {
 		XDNA_ERR(xdna, "Failed to allocate DMA buffer, ret %ld",
 			 PTR_ERR(dma_hdl));
@@ -246,7 +247,8 @@ static int amdxdna_aie_tile_write_mem(struct amdxdna_hwctx *hwctx,
 	struct amdxdna_msg_buf_hdl *dma_hdl;
 	int ret;
 
-	dma_hdl = amdxdna_alloc_msg_buff(xdna, wa->access->size);
+	/* Tile memory: read by AIE shim DMA, not the firmware processor. */
+	dma_hdl = amdxdna_alloc_msg_buff(xdna, wa->access->size, false);
 	if (IS_ERR(dma_hdl)) {
 		XDNA_ERR(xdna, "Failed to allocate DMA buffer, ret %ld",
 			 PTR_ERR(dma_hdl));

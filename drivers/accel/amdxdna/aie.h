@@ -185,6 +185,8 @@ int amdxdna_get_frame_boundary_preempt_state(struct aie_device *aie,
 					     struct amdxdna_drm_get_info *args);
 struct amdxdna_msg_buf_hdl {
 	struct amdxdna_dev	*xdna;
+	/* Non-NULL when backed by a reserved-memory carveout bank (OF). */
+	void			*cbuf;
 	void			*vaddr;
 	dma_addr_t		dma_addr;
 	u32			size;
@@ -194,7 +196,13 @@ struct amdxdna_msg_buf_hdl {
 #define to_dma_addr(hdl, offset)  ((hdl)->dma_addr + (offset))
 #define to_buf_size(hdl)          ((hdl)->size)
 
-struct amdxdna_msg_buf_hdl *amdxdna_alloc_msg_buff(struct amdxdna_dev *xdna, u32 size);
+/*
+ * @fw selects the firmware bank for buffers the firmware processor itself
+ * dereferences (async event, fw log/trace, work buffer). Buffers written/read by
+ * AIE/CERT shim DMA (coredump, column dump, tile mem, telemetry) pass fw=false.
+ */
+struct amdxdna_msg_buf_hdl *amdxdna_alloc_msg_buff(struct amdxdna_dev *xdna, u32 size,
+						   bool fw);
 void amdxdna_free_msg_buff(struct amdxdna_msg_buf_hdl *hdl);
 
 /* aie_psp.c */

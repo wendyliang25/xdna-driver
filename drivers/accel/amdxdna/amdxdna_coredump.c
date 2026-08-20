@@ -61,7 +61,8 @@ char *amdxdna_get_hwctx_coredump(struct aie_device *aie, struct amdxdna_hwctx *h
 		return ERR_PTR(-ENOMEM);
 
 	num_bufs = total_size / coredump_data_chunk_size;
-	list_hdl = amdxdna_alloc_msg_buff(xdna, num_bufs * sizeof(*buf_list));
+	/* Coredump list + chunks: written by AIE shim DMA, not the firmware. */
+	list_hdl = amdxdna_alloc_msg_buff(xdna, num_bufs * sizeof(*buf_list), false);
 	if (IS_ERR(list_hdl)) {
 		ret = PTR_ERR(list_hdl);
 		list_hdl = NULL;
@@ -79,7 +80,7 @@ char *amdxdna_get_hwctx_coredump(struct aie_device *aie, struct amdxdna_hwctx *h
 	}
 
 	for (i = 0; i < num_bufs; i++) {
-		data_hdls[i] = amdxdna_alloc_msg_buff(xdna, coredump_data_chunk_size);
+		data_hdls[i] = amdxdna_alloc_msg_buff(xdna, coredump_data_chunk_size, false);
 		if (IS_ERR(data_hdls[i])) {
 			ret = PTR_ERR(data_hdls[i]);
 			data_hdls[i] = NULL;

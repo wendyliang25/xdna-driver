@@ -361,7 +361,8 @@ int aie4_alloc_work_buffer(struct amdxdna_dev_hdl *ndev)
 {
 	struct amdxdna_dev *xdna = ndev->aie.xdna;
 
-	ndev->work_buf_hdl = amdxdna_alloc_msg_buff(xdna, AIE4_WORK_BUFFER_MIN_SIZE);
+	/* mpnpufw scratch: dereferenced by the firmware processor. */
+	ndev->work_buf_hdl = amdxdna_alloc_msg_buff(xdna, AIE4_WORK_BUFFER_MIN_SIZE, true);
 	if (IS_ERR(ndev->work_buf_hdl)) {
 		int ret = PTR_ERR(ndev->work_buf_hdl);
 

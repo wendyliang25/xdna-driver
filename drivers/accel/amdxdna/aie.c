@@ -14,6 +14,7 @@
 #include <linux/uaccess.h>
 
 #include "aie.h"
+#include "amdxdna_cbuf.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_gem.h"
 #include "amdxdna_mailbox_helper.h"
@@ -247,7 +248,8 @@ int amdxdna_get_aie_status(struct aie_device *aie,
 	if (!alloc_sz)
 		return -EINVAL;
 
-	buf_hdl = amdxdna_alloc_msg_buff(xdna, alloc_sz);
+	/* Column dump: written by AIE shim DMA, not the firmware processor. */
+	buf_hdl = amdxdna_alloc_msg_buff(xdna, alloc_sz, false);
 	if (IS_ERR(buf_hdl))
 		return PTR_ERR(buf_hdl);
 
@@ -430,7 +432,8 @@ int amdxdna_get_frame_boundary_preempt_state(struct aie_device *aie,
 	return 0;
 }
 
-struct amdxdna_msg_buf_hdl *amdxdna_alloc_msg_buff(struct amdxdna_dev *xdna, u32 size)
+struct amdxdna_msg_buf_hdl *amdxdna_alloc_msg_buff(struct amdxdna_dev *xdna, u32 size,
+						   bool fw)
 {
 	struct amdxdna_msg_buf_hdl *hdl;
 	int order;
@@ -450,10 +453,24 @@ struct amdxdna_msg_buf_hdl *amdxdna_alloc_msg_buff(struct amdxdna_dev *xdna, u32
 		hdl->vaddr = amdxdna_iommu_alloc(xdna, hdl->size, &hdl->dma_addr);
 		if (IS_ERR(hdl->vaddr))
 			goto free_hdl;
+	} else if (amdxdna_use_carveout(xdna)) {
+		/*
+		 * Contiguous DRAM (OF platform / x86 carveout bring-up): allocate
+		 * from the firmware or first app bank per @fw, else the debugfs
+		 * carveout, else system-default CMA. amdxdna_cbuf_kalloc() walks that
+		 * fallback chain and returns a cookie stored in the handle for freeing.
+		 */
+		hdl->cbuf = amdxdna_cbuf_kalloc(xdna, hdl->size, fw, DMA_FROM_DEVICE,
+						&hdl->vaddr, &hdl->dma_addr);
+		if (IS_ERR(hdl->cbuf)) {
+			hdl->cbuf = NULL;
+			goto free_hdl;
+		}
 	} else {
+		/* SVA/PASID with no carveout: plain (software-coherent) DMA. */
 		hdl->vaddr = dma_alloc_noncoherent(xdna->ddev.dev, hdl->size,
-						   &hdl->dma_addr,
-						   DMA_FROM_DEVICE, GFP_KERNEL);
+						   &hdl->dma_addr, DMA_FROM_DEVICE,
+						   GFP_KERNEL);
 		if (!hdl->vaddr)
 			goto free_hdl;
 	}
@@ -470,14 +487,13 @@ void amdxdna_free_msg_buff(struct amdxdna_msg_buf_hdl *hdl)
 	if (!hdl)
 		return;
 
-	if (amdxdna_iova_on(hdl->xdna)) {
-		amdxdna_iommu_free(hdl->xdna, hdl->size, hdl->vaddr,
-				   hdl->dma_addr);
-	} else {
-		dma_free_noncoherent(hdl->xdna->ddev.dev, hdl->size,
-				     hdl->vaddr, hdl->dma_addr,
-				     DMA_FROM_DEVICE);
-	}
+	if (hdl->cbuf)
+		amdxdna_cbuf_kfree(hdl->cbuf);
+	else if (amdxdna_iova_on(hdl->xdna))
+		amdxdna_iommu_free(hdl->xdna, hdl->size, hdl->vaddr, hdl->dma_addr);
+	else
+		dma_free_noncoherent(hdl->xdna->ddev.dev, hdl->size, hdl->vaddr,
+				     hdl->dma_addr, DMA_FROM_DEVICE);
 
 	kfree(hdl);
 }
