@@ -98,12 +98,24 @@ static int amdxdna_plat_probe(struct platform_device *pdev)
 		goto iommu_fini;
 	}
 
+	/*
+	 * Bind the DT memory banks before device init: the firmware handshake in
+	 * ops->init allocates its mgmt buffers from the firmware bank. All banks are
+	 * mapped through this device; the firmware bank's 32-bit reachability comes
+	 * from its reserved-memory region being placed below 4 GB.
+	 */
+	ret = amdxdna_mem_banks_init(xdna, dev->of_node);
+	if (ret) {
+		XDNA_ERR(xdna, "Memory bank init failed, ret %d", ret);
+		goto iommu_fini;
+	}
+
 	mutex_lock(&xdna->dev_lock);
 	ret = xdna->dev_info->ops->init(xdna);
 	mutex_unlock(&xdna->dev_lock);
 	if (ret) {
 		XDNA_ERR(xdna, "Hardware init failed, ret %d", ret);
-		goto iommu_fini;
+		goto banks_fini;
 	}
 
 	ret = amdxdna_sysfs_init(xdna);
@@ -128,6 +140,8 @@ failed_dev_fini:
 	mutex_lock(&xdna->dev_lock);
 	xdna->dev_info->ops->fini(xdna);
 	mutex_unlock(&xdna->dev_lock);
+banks_fini:
+	amdxdna_mem_banks_fini(xdna);
 iommu_fini:
 	amdxdna_iommu_fini(xdna);
 	return ret;
@@ -152,6 +166,7 @@ static void amdxdna_plat_remove(struct platform_device *pdev)
 	mutex_unlock(&xdna->dev_lock);
 	mutex_unlock(&xdna->client_lock);
 
+	amdxdna_mem_banks_fini(xdna);
 	amdxdna_iommu_fini(xdna);
 }
 
