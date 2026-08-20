@@ -47,16 +47,31 @@ properties:
 
   memory-region:
     minItems: 2
-    maxItems: 2
+    maxItems: 11
     description: |
-      Phandles to reserved-memory nodes.  Order must match
-      memory-region-names.  Each region is mapped as device memory
-      (non-cacheable).
+      Phandles to reserved-memory regions, matched by name via
+      memory-region-names.  "mgmt"/"doorbell" are predefined-layout regions
+      accessed only by the CPU (ioremap).  "fw" and "aie<N>" are contiguous DRAM
+      pools the driver sub-allocates DMA buffers from (see memory-region-names).
 
   memory-region-names:
+    minItems: 2
+    maxItems: 11
+    description: |
+      Names of the memory-region phandles.  Required: "mgmt", "doorbell".
+      Optional DMA pools: "fw" (firmware-visible; place its reserved-memory
+      below 4 GB, as the firmware processor reaches only 32-bit) and "aie<N>"
+      (AIE/CERT pools).  All pools are DMA-mapped through this device.  The
+      driver maps these to fixed userspace bank ids used in the create-BO
+      flags: "fw" -> 0, "aie<N>" -> N + 1.
     items:
-      - const: mgmt
-      - const: doorbell
+      enum: [mgmt, doorbell, fw, aie0, aie1, aie2, aie3, aie4, aie5, aie6]
+
+  iommus:
+    maxItems: 1
+    description: |
+      SMMU stream ID for this device's own DMA -- the AIE/CERT path used by the
+      "aie<N>" pools.  Present when the SMMU is enabled.
 
 required:
   - compatible
@@ -92,6 +107,18 @@ examples:
                 reg = <0x0 0x3e100000 0x0 0x10000>;
                 no-map;
             };
+
+            /* firmware-visible carveout, < 4 GB for the RPU */
+            rpu_cma: rpu-cma@70000000 {
+                reg = <0x0 0x70000000 0x0 0x4000000>;
+                no-map;
+            };
+
+            /* AIE/CERT DMA carveout (contiguous, cacheable) */
+            aie_cma0: aie-cma@800000000 {
+                reg = <0x8 0x00000000 0x0 0x40000000>;
+                no-map;
+            };
         };
     };
 
@@ -112,11 +139,18 @@ examples:
         };
     };
 
+    /* SMMU (present when the IOMMU is enabled); provides the AIE stream ID. */
+    smmu: iommu {
+        #iommu-cells = <1>;
+    };
+
     /* amdxdna platform (shared-memory + IPI) transport node */
     amdxdna: amdxdna {
         compatible = "amd,amdxdna";
         mboxes = <&ipi_aie 0>, <&ipi_aie 1>;
         mbox-names = "tx", "rx";
-        memory-region = <&mgmt_shmem>, <&doorbell_shmem>;
-        memory-region-names = "mgmt", "doorbell";
+        /* amdxdna's own DMA (AIE/CERT path) stream ID for the "aie<N>" pools */
+        iommus = <&smmu 0x2>;
+        memory-region = <&mgmt_shmem>, <&doorbell_shmem>, <&rpu_cma>, <&aie_cma0>;
+        memory-region-names = "mgmt", "doorbell", "fw", "aie0";
     };
