@@ -207,10 +207,18 @@ struct amdxdna_dev {
 	 * AMDXDNA_MEM_BANK_FW (0) is the firmware-visible bank; ids >= 1 are
 	 * AIE/CERT app banks. Memory comes from amdxdna's own reserved-memory,
 	 * DMA-mapped through this device. The firmware bank's 32-bit reachability
-	 * comes from its reserved-memory region being placed below 4 GB. See
-	 * amdxdna_cbuf.c.
+	 * normally comes from its reserved-memory region being placed below 4 GB.
+	 * See amdxdna_cbuf.c.
 	 */
 	struct xarray			banks;
+	/*
+	 * Optional firmware DMA-master core device (from the "amd,fw-dma-master" DT
+	 * phandle). When present, firmware-bank buffers are DMA-mapped through it
+	 * so the master's DMA context (32-bit mask, plus an IOMMU stream ID when
+	 * present) applies -- needed when the firmware processor is behind an SMMU.
+	 * We hold a reference to it; NULL means the firmware bank uses this device.
+	 */
+	struct device			*fw_dev;
 
 	/* Firmware Debug/Profile/Trace (DPT) framework. Each channel owns the
 	 * SRCU domain guarding its own handle; on disable we synchronize_srcu
