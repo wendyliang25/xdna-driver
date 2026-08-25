@@ -30,10 +30,12 @@
  * system CMA on this device when it has no region. The firmware bank must be
  * placed below 4 GB so the 32-bit firmware processor can dereference it; that
  * reachability is a property of the reserved-memory placement, not a driver
- * mask. When a bank is absent (x86 bring-up), allocation falls back to the
- * debugfs carveout (a raw range mapped with dma_map_resource + ioremap_cache),
- * then to system-default CMA. All backings are cacheable; coherency is
- * software-managed (SYNC_BO / drm_clflush + DPT reads).
+ * mask. When the firmware processor is behind an SMMU (xdna->fw_dev, from
+ * "amd,fw-dma-master"), the firmware bank instead allocates through that device
+ * so its IOMMU stream ID applies. When a bank is absent (x86 bring-up),
+ * allocation falls back to the debugfs carveout (a raw range mapped with
+ * dma_map_resource + ioremap_cache), then to system-default CMA. All backings
+ * are cacheable; coherency is software-managed (SYNC_BO / drm_clflush + DPT reads).
  */
 
 /* Debugfs single carveout (x86 bring-up). */
@@ -763,6 +765,18 @@ amdxdna_bank_create(struct amdxdna_dev *xdna, struct device_node *np,
 	if (!bank)
 		return ERR_PTR(-ENOMEM);
 	bank->fw = fw;
+
+	/*
+	 * When the firmware processor is behind an SMMU its buffers must live in
+	 * its IOMMU domain, so allocate the firmware bank through fw_dev (which
+	 * carries that stream ID) rather than from our reserved pool. fw_dev is
+	 * used as-is -- we never bind a reserved region to it.
+	 */
+	if (fw && xdna->fw_dev) {
+		bank->dev = xdna->fw_dev;
+		XDNA_INFO(xdna, "fw bank %u: dma-master %s", id, dev_name(bank->dev));
+		return bank;
+	}
 
 	if (np && region_idx >= 0)
 		rmem_np = of_parse_phandle(np, "memory-region", region_idx);
