@@ -51,7 +51,23 @@ struct amdxdna_mem_bank {
 
 /* struct amdxdna_dev (amdxdna_drv.h) */
 struct xarray  banks;      /* keyed by fixed bank id */
+struct device *fw_dev;     /* optional firmware DMA-master core dev (amd,fw-dma-master) */
 ```
+
+### Optional `amd,fw-dma-master` (firmware processor behind an SMMU)
+
+The placement-only model above assumes the firmware processor addresses physical
+DRAM. If a platform instead routes it through the SMMU with its own stream ID, a
+physical address is not enough — the firmware bank must be DMA-mapped in *that
+master's* IOMMU domain. For that case the amdxdna node may carry an optional
+`amd,fw-dma-master` phandle to that master's DT node (e.g. an r5f core).
+The driver resolves it with `of_find_device_by_node()` (not `rproc_get_by_phandle`,
+so there is no remoteproc coupling) and uses that device (`xdna->fw_dev`) as the
+firmware bank's DMA device, inheriting its 32-bit mask and stream ID. Because the
+cluster driver configures the core device's DMA during its own probe and no
+driver binds to the core node itself, resolution defers (`-EPROBE_DEFER`) until
+the core's parent is bound. It is absent in Xen domU, where the guest has no
+firmware-processor node and placement suffices.
 
 ## 4. Device-tree contract
 
@@ -108,10 +124,10 @@ with those flushes.
 
 | File | Change |
 |---|---|
-| `amdxdna_drv.h` | `struct xarray banks` |
+| `amdxdna_drv.h` | `struct xarray banks`; optional `struct device *fw_dev` |
 | `include/uapi/drm/amdxdna_accel.h` | `AMDXDNA_MEM_BANK_FW/_AIE`; `create_bo.flags` bank-id bitmap |
 | `amdxdna_cbuf.c` / `.h` | banks over xarray; carveout + system-CMA backings; get_cbuf/kalloc (with `fw`) + fallback chain; parse `memory-region-names` |
-| `amdxdna_platform.c` | `mem_banks_init/_fini` |
+| `amdxdna_platform.c` | `mem_banks_init/_fini`; optional `amd,fw-dma-master` resolve (`of_find_device_by_node`) |
 | `aie.c` / `aie.h` | firmware buffers via `amdxdna_cbuf_kalloc`; `amdxdna_alloc_msg_buff(..., fw)` |
 | `aie4.c`, `amdxdna_dpt.c`, `amdxdna_error.c` | classify fw buffers (`fw=true`) |
 | `aie.c`, `aie2_message.c`, `aie4_message.c` | classify AIE/CERT buffers (`fw=false`) |
@@ -122,11 +138,9 @@ with those flushes.
 
 ## 9. Open items / caveats
 
-- **SMMU + firmware processor with its own stream ID**: this design assumes the
-  firmware processor addresses physical DRAM (no SMMU stream ID), so placement
-  suffices. If a platform genuinely translates the firmware processor through the
-  SMMU, the firmware bank needs a DMA mapping in *that* master's domain — handled
-  by an optional firmware DMA-master extension (separate change).
+- **SMMU + firmware processor with its own stream ID**: handled by the optional
+  `amd,fw-dma-master` phandle (see §3). When absent, the design assumes the firmware
+  processor addresses physical DRAM and placement below 4 GB suffices.
 - **No-SMMU + >4 GB app pool**: the amdxdna node needs a `dma-ranges` to widen
   its mask past 32 bits (integrator DT), since without the SMMU the mask defaults
   to 32-bit.

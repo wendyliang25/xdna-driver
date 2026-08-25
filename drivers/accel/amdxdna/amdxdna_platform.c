@@ -22,6 +22,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
@@ -38,6 +39,49 @@ static void amdxdna_plat_drm_release(struct drm_device *drm, void *res)
 
 	cleanup_srcu_struct(&xdna->dpt_srcu);
 	ida_destroy(&xdna->hwctx_ida);
+}
+
+/*
+ * Resolve the optional firmware DMA master -- the processor (e.g. an r5f core)
+ * that accesses the firmware memory bank. That bank must be mapped through the
+ * master's DMA context (32-bit mask, plus an IOMMU stream ID when present), which
+ * the DMA API derives from the master's struct device, so we take the master's
+ * own core device via its DT node -- not its remoteproc handle -- and there is no
+ * remoteproc coupling. The cluster (e.g. r5fss) driver configures that core
+ * device's DMA during probe, and no driver binds to the core node itself, so
+ * defer until its parent is bound. Absent "amd,fw-dma-master" (e.g. a Xen domU
+ * with no firmware-processor node) means the firmware bank uses this device and
+ * relies on its reserved-memory being placed below 4 GB.
+ */
+static int amdxdna_plat_get_fw_dev(struct amdxdna_dev *xdna, struct device_node *np)
+{
+	struct platform_device *fw_pdev;
+	struct device_node *fw_np;
+
+	fw_np = of_parse_phandle(np, "amd,fw-dma-master", 0);
+	if (!fw_np)
+		return 0;
+
+	fw_pdev = of_find_device_by_node(fw_np);
+	of_node_put(fw_np);
+	if (!fw_pdev)
+		return -EPROBE_DEFER;
+
+	if (!fw_pdev->dev.parent || !device_is_bound(fw_pdev->dev.parent)) {
+		platform_device_put(fw_pdev);
+		return -EPROBE_DEFER;
+	}
+
+	xdna->fw_dev = &fw_pdev->dev;
+	return 0;
+}
+
+static void amdxdna_plat_put_fw_dev(struct amdxdna_dev *xdna)
+{
+	if (xdna->fw_dev) {
+		put_device(xdna->fw_dev);
+		xdna->fw_dev = NULL;
+	}
 }
 
 static int amdxdna_plat_probe(struct platform_device *pdev)
@@ -97,15 +141,20 @@ static int amdxdna_plat_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	/*
-	 * Bind the DT memory banks before device init (the firmware handshake
-	 * allocates mgmt buffers from the firmware bank). All banks are mapped
-	 * through this device; the firmware bank's 32-bit reachability comes from
-	 * its reserved-memory region being placed below 4 GB.
+	 * Resolve the optional firmware DMA device, then bind the DT memory banks
+	 * before device init (the firmware handshake allocates mgmt buffers from the
+	 * firmware bank). Firmware-bank buffers map through that device when present;
+	 * otherwise their 32-bit reachability comes from the reserved-memory being
+	 * placed below 4 GB.
 	 */
+	ret = amdxdna_plat_get_fw_dev(xdna, dev->of_node);
+	if (ret)
+		return ret;
+
 	ret = amdxdna_mem_banks_init(xdna, dev->of_node);
 	if (ret) {
 		XDNA_ERR(xdna, "Memory bank init failed, ret %d", ret);
-		return ret;
+		goto put_fw_dev;
 	}
 
 	/*
@@ -145,6 +194,8 @@ dev_fini:
 	mutex_unlock(&xdna->dev_lock);
 banks_fini:
 	amdxdna_mem_banks_fini(xdna);
+put_fw_dev:
+	amdxdna_plat_put_fw_dev(xdna);
 	return ret;
 }
 
@@ -167,6 +218,7 @@ static void amdxdna_plat_remove(struct platform_device *pdev)
 	mutex_unlock(&xdna->client_lock);
 
 	amdxdna_mem_banks_fini(xdna);
+	amdxdna_plat_put_fw_dev(xdna);
 }
 
 static const struct of_device_id amdxdna_plat_of_match[] = {

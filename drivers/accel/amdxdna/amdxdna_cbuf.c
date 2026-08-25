@@ -28,10 +28,12 @@
  * amdxdna's own reserved-memory (a named region, drm_mm-suballocated and mapped
  * with dma_map_resource + ioremap_cache) or system CMA when it has no region.
  * The firmware bank must be placed below 4 GB so the firmware processor, which
- * only reaches 32-bit, can dereference it; that reachability is a property of
- * the reserved-memory placement, not of any borrowed DMA master. When a bank is
- * absent (x86 bring-up), allocation falls back to the debugfs carveout, then to
- * system-default CMA on the platform device. All backings are cacheable;
+ * only reaches 32-bit, can dereference it; that reachability is normally a
+ * property of the reserved-memory placement. When the firmware processor is
+ * behind an SMMU, its core device (xdna->fw_dev, from "amd,fw-dma-master") is used
+ * as the firmware bank's DMA device so its 32-bit mask/stream ID apply. When a
+ * bank is absent (x86 bring-up), allocation falls back to the debugfs carveout,
+ * then to system-default CMA on the platform device. All backings are cacheable;
  * coherency is software-managed (SYNC_BO / drm_clflush + DPT reads).
  */
 
@@ -700,6 +702,9 @@ void amdxdna_cbuf_kfree(void *cookie)
 /* Master DMA device a bank's buffers are mapped through. */
 static struct device *amdxdna_bank_dma_dev(struct amdxdna_dev *xdna, bool fw)
 {
+	if (fw && xdna->fw_dev)
+		return xdna->fw_dev;
+
 	return xdna->ddev.dev;
 }
 
