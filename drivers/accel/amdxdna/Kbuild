@@ -52,7 +52,6 @@ amdxdna-y += \
 	aie4_ctx.o \
 	aie4_error.o \
 	aie4_message.o \
-	aie4_pci.o \
 	amdxdna_dpt.o \
 	amdxdna_dpt_pci.o \
 	amdxdna_error.o \
@@ -64,6 +63,19 @@ amdxdna-y += \
 	npu4_regs.o \
 	npu5_regs.o \
 	npu6_regs.o
+
+# aie4 transport select: the platform build compiles the transport-independent
+# aie4 core and drops the PCI transport; the default build keeps the PCI
+# transport. The two provide the same aie4 symbols, so only one is ever built.
+amdxdna-$(CONFIG_DRM_ACCEL_AMDXDNA_PLAT) += \
+	aie4.o \
+	aie4_debugfs.o \
+	aie4_dpt.o
+
+ifeq ($(CONFIG_DRM_ACCEL_AMDXDNA_PLAT),)
+amdxdna-y += \
+	aie4_pci.o
+endif
 
 amdxdna-$(CONFIG_PCI_IOV) += \
 	aie4_sriov.o
