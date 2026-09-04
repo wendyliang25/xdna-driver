@@ -175,6 +175,13 @@ int aie4_doorbell_setup(struct amdxdna_hwctx *hwctx,
 void aie4_doorbell_ring(struct amdxdna_hwctx *hwctx);
 int aie4_request_notification(struct cert_comp *comp);
 void aie4_free_notification(struct cert_comp *comp);
+/*
+ * SR-IOV virtual functions exist only on the PCI transport, so VF detection is
+ * transport-specific: the PCI hook compares against aie4_vf_ops while the
+ * platform hook returns false.  Shared code (aie4_message.c) reaches it through
+ * this hook instead of referencing the PCI-only aie4_vf_ops symbol.
+ */
+bool aie4_is_vf(struct amdxdna_dev_hdl *ndev);
 
 /* aie4_message.c */
 int aie4_query_aie_metadata(struct amdxdna_dev_hdl *ndev,
