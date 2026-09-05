@@ -29,7 +29,6 @@ amdxdna-y := \
 	amdxdna_iommu.o \
 	amdxdna_mailbox.o \
 	amdxdna_mailbox_helper.o \
-	amdxdna_pci_drv.o \
 	amdxdna_pm.o \
 	amdxdna_sysfs.o \
 	amdxdna_ubuf.o \
@@ -40,6 +39,22 @@ amdxdna-y := \
 
 amdxdna-y += \
 	aie.o \
+	aie4_ctx.o \
+	aie4_error.o \
+	aie4_message.o \
+	amdxdna_dpt.o \
+	amdxdna_dpt_pci.o \
+	amdxdna_error.o \
+	amdxdna_coredump.o \
+	amdxdna_ctx_status.o \
+	amdxdna_tile_read_write.o
+
+# The aie2 PCI driver uses the DRM GPU scheduler; the platform (aie4) build
+# targets non-PCI parts whose kernels may be built without DRM_SCHED, so the
+# aie2 driver, its PSP/SMU layer and its PCI register tables are not compiled
+# there. (aie.o is the shared mgmt-mailbox layer and stays in both builds.)
+ifeq ($(CONFIG_DRM_ACCEL_AMDXDNA_PLAT),)
+amdxdna-y += \
 	aie_psp.o \
 	aie_smu.o \
 	aie2_ctx.o \
@@ -49,32 +64,30 @@ amdxdna-y += \
 	aie2_pm.o \
 	aie2_solver.o \
 	aie2_tdr.o \
-	aie4_ctx.o \
-	aie4_error.o \
-	aie4_message.o \
-	amdxdna_dpt.o \
-	amdxdna_dpt_pci.o \
-	amdxdna_error.o \
-	amdxdna_coredump.o \
-	amdxdna_ctx_status.o \
-	amdxdna_tile_read_write.o \
 	npu1_regs.o \
-	npu3_regs.o \
 	npu4_regs.o \
 	npu5_regs.o \
 	npu6_regs.o
+endif
 
-# aie4 transport select: the platform build compiles the transport-independent
-# aie4 core and drops the PCI transport; the default build keeps the PCI
-# transport. The two provide the same aie4 symbols, so only one is ever built.
+# Transport select: the platform build compiles the transport-independent aie4
+# core plus the platform driver and drops the PCI transport and PCI module
+# entry; the default build keeps the PCI transport and PCI driver. The two
+# provide the same aie4 symbols and the single module entry point, so only one
+# side is ever built.
 amdxdna-$(CONFIG_DRM_ACCEL_AMDXDNA_PLAT) += \
 	aie4.o \
 	aie4_debugfs.o \
-	aie4_dpt.o
+	aie4_dpt.o \
+	aie4_plat.o \
+	amdxdna_plat_drv.o \
+	npu3b_regs.o
 
 ifeq ($(CONFIG_DRM_ACCEL_AMDXDNA_PLAT),)
 amdxdna-y += \
-	aie4_pci.o
+	aie4_pci.o \
+	amdxdna_pci_drv.o \
+	npu3_regs.o
 endif
 
 amdxdna-$(CONFIG_PCI_IOV) += \
