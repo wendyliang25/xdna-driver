@@ -27,7 +27,6 @@ amdxdna-y := \
 	amdxdna_drm.o \
 	amdxdna_gem.o \
 	amdxdna_iommu.o \
-	amdxdna_mailbox.o \
 	amdxdna_mailbox_helper.o \
 	amdxdna_pm.o \
 	amdxdna_sysfs.o \
@@ -71,21 +70,24 @@ amdxdna-y += \
 endif
 
 # Transport select: the platform build compiles the transport-independent aie4
-# core plus the platform driver and drops the PCI transport and PCI module
-# entry; the default build keeps the PCI transport and PCI driver. The two
-# provide the same aie4 symbols and the single module entry point, so only one
-# side is ever built.
+# core, the shmem+IPI mailbox and the platform driver, and drops the PCI
+# transport, the PCI ringbuf+MSI-X mailbox and the PCI module entry; the default
+# build keeps the PCI side. amdxdna_mailbox.o and amdxdna_mailbox_plat.o both
+# provide struct mailbox and the amdxdna_mailbox.h API, and each side provides
+# the same aie4 symbols and the single module entry point, so only one is built.
 amdxdna-$(CONFIG_DRM_ACCEL_AMDXDNA_PLAT) += \
 	aie4.o \
 	aie4_debugfs.o \
 	aie4_dpt.o \
 	aie4_plat.o \
+	amdxdna_mailbox_plat.o \
 	amdxdna_plat_drv.o \
 	npu3b_regs.o
 
 ifeq ($(CONFIG_DRM_ACCEL_AMDXDNA_PLAT),)
 amdxdna-y += \
 	aie4_pci.o \
+	amdxdna_mailbox.o \
 	amdxdna_pci_drv.o \
 	npu3_regs.o
 endif
