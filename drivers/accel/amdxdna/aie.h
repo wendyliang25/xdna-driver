@@ -7,6 +7,7 @@
 
 #include "amdxdna_drv.h"
 #include "amdxdna_mailbox.h"
+#include <linux/dma-direction.h>
 
 #define AIE_INTERVAL	20000	/* us */
 #define AIE_TIMEOUT	1000000	/* us */
@@ -198,7 +199,10 @@ struct amdxdna_msg_buf_hdl {
 struct amdxdna_msg_buf_hdl *amdxdna_alloc_msg_buff(struct amdxdna_dev *xdna, u32 size,
 						   bool fw);
 void amdxdna_free_msg_buff(struct amdxdna_msg_buf_hdl *hdl);
+void amdxdna_msg_buff_sync(struct amdxdna_msg_buf_hdl *hdl, u64 offset, u64 size,
+			   enum dma_data_direction dir);
 void amdxdna_msg_buff_sync_for_device(struct amdxdna_msg_buf_hdl *hdl);
+void amdxdna_msg_buff_sync_for_cpu(struct amdxdna_msg_buf_hdl *hdl);
 
 /* aie_psp.c */
 struct psp_device *aiem_psp_create(struct drm_device *ddev, struct psp_config *conf);
