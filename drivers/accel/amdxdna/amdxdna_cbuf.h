@@ -40,6 +40,7 @@ void *amdxdna_cbuf_kalloc(struct amdxdna_dev *xdna, size_t size, bool fw,
 			  enum dma_data_direction dir,
 			  void **vaddr, dma_addr_t *dma_addr);
 void amdxdna_cbuf_kfree(void *cookie);
+void amdxdna_cbuf_ksync_for_device(void *cookie);
 bool amdxdna_mem_banks_present(struct amdxdna_dev *xdna);
 
 #endif
