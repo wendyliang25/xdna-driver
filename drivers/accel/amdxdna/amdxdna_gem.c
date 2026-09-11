@@ -1410,56 +1410,25 @@ int amdxdna_drm_get_bo_info_ioctl(struct drm_device *dev, void *data, struct drm
 	return ret;
 }
 
-#ifdef CONFIG_X86
 /*
- * The x86 NPU (aie2) is not cache-coherent, but the DMA layer still reports the
- * device as coherent, so the streaming dma_sync_*() helpers would no-op. Flush
- * explicitly with drm_clflush_*(), the x86 cache-maintenance primitive, which
- * both cleans and invalidates regardless of @dir.
+ * Cache-sync [offset, offset+size) of an already-resolved, device-mapped
+ * sg_table through the DMA API. Real cache maintenance happens only when @dev is
+ * non-coherent (dev_is_dma_coherent() == false); on a coherent device each
+ * dma_sync_single_*() short-circuits, so this is a clean no-op -- correct on both
+ * the coherent aie4 PCI part (x86) and the non-coherent aie4 platform (arm64).
+ *
+ * Takes no locks (unlike amdxdna_gem_get_sgt(), which takes the BO's dma_resv),
+ * so a caller that has cached a stable sgt may use it on hot/atomic paths -- e.g.
+ * the aie4 KMQ completion poll that runs as a wait_event() condition. The sgt is
+ * mapped in buffer order, so a byte offset walks the DMA segment lengths.
  */
-static int amdxdna_flush_bo_range(struct amdxdna_gem_obj *abo, u64 offset,
-				  u64 size, enum dma_data_direction dir)
+void amdxdna_dma_sync_sgt(struct device *dev, struct sg_table *sgt, u64 offset,
+			  u64 size, enum dma_data_direction dir)
 {
-	unsigned long first = offset >> PAGE_SHIFT;
-	unsigned long nr_pages = (PAGE_ALIGN(offset + size) >> PAGE_SHIFT) - first;
-	void *kva;
-
-	kva = amdxdna_gem_vmap_try(abo);
-	if (!IS_ERR(kva))
-		drm_clflush_virt_range(kva + offset, size);
-	else if (is_import_bo(abo))
-		drm_clflush_sg(abo->base.sgt);
-	else if (abo->base.pages)
-		drm_clflush_pages(&abo->base.pages[first], nr_pages);
-	else if (abo->mem.pages)
-		drm_clflush_pages(&abo->mem.pages[first], nr_pages);
-	else
-		return -EINVAL;
-
-	return 0;
-}
-#else
-/*
- * drm_clflush_*() has no implementation outside x86 (it warns and no-ops), so
- * cache-sync the [offset, offset+size) sub-window of the device-mapped
- * sg_table through the DMA API instead. This performs cache maintenance only
- * when the device is non-coherent and is a clean no-op on the coherent aie4
- * platform. The sgt is mapped in buffer order, so a byte offset into the BO
- * walks the running sum of the DMA segment lengths.
- */
-static int amdxdna_flush_bo_range(struct amdxdna_gem_obj *abo, u64 offset,
-				  u64 size, enum dma_data_direction dir)
-{
-	struct device *dev = to_xdna_dev(to_gobj(abo)->dev)->ddev.dev;
 	u64 skip = offset;
 	u64 remaining = size;
 	struct scatterlist *sg;
-	struct sg_table *sgt;
 	int i;
-
-	sgt = amdxdna_gem_get_sgt(abo);
-	if (IS_ERR_OR_NULL(sgt))
-		return -EINVAL;
 
 	for_each_sgtable_dma_sg(sgt, sg, i) {
 		unsigned int seg_len = sg_dma_len(sg);
@@ -1483,11 +1452,67 @@ static int amdxdna_flush_bo_range(struct amdxdna_gem_obj *abo, u64 offset,
 		remaining -= chunk_len;
 		skip = 0;
 	}
+}
+
+/* Resolve @abo's sgt (locks the BO's dma_resv) then sync [offset, size). */
+static int amdxdna_gem_dma_sync(struct amdxdna_gem_obj *abo, u64 offset,
+				u64 size, enum dma_data_direction dir)
+{
+	struct device *dev = to_xdna_dev(to_gobj(abo)->dev)->ddev.dev;
+	struct sg_table *sgt;
+
+	sgt = amdxdna_gem_get_sgt(abo);
+	if (IS_ERR_OR_NULL(sgt))
+		return -EINVAL;
+
+	amdxdna_dma_sync_sgt(dev, sgt, offset, size, dir);
 
 	return 0;
 }
+
+#ifdef CONFIG_X86
+/*
+ * SYNC_BO on x86: the aie2 NPU is not cache-coherent, but the DMA layer reports
+ * the device coherent, so dma_sync_*() would no-op. Flush explicitly with
+ * drm_clflush_*(), the x86 cache-maintenance primitive, which both cleans and
+ * invalidates regardless of @dir. (The aie4 PCI part is genuinely coherent, so
+ * its KMQ path uses amdxdna_gem_dma_sync_range() and is a real no-op there.)
+ */
+static int amdxdna_flush_bo_range(struct amdxdna_gem_obj *abo, u64 offset,
+				  u64 size, enum dma_data_direction dir)
+{
+	unsigned long first = offset >> PAGE_SHIFT;
+	unsigned long nr_pages = (PAGE_ALIGN(offset + size) >> PAGE_SHIFT) - first;
+	void *kva;
+
+	kva = amdxdna_gem_vmap_try(abo);
+	if (!IS_ERR(kva))
+		drm_clflush_virt_range(kva + offset, size);
+	else if (is_import_bo(abo))
+		drm_clflush_sg(abo->base.sgt);
+	else if (abo->base.pages)
+		drm_clflush_pages(&abo->base.pages[first], nr_pages);
+	else if (abo->mem.pages)
+		drm_clflush_pages(&abo->mem.pages[first], nr_pages);
+	else
+		return -EINVAL;
+
+	return 0;
+}
+#else
+/* Outside x86 drm_clflush_*() warns and no-ops, so use the DMA API. */
+static int amdxdna_flush_bo_range(struct amdxdna_gem_obj *abo, u64 offset,
+				  u64 size, enum dma_data_direction dir)
+{
+	return amdxdna_gem_dma_sync(abo, offset, size, dir);
+}
 #endif
 
+/*
+ * SYNC_BO ioctl helper: cache-sync [offset, offset+size) of @abo (clamped to
+ * the BO). Arch-gated (see amdxdna_flush_bo_range) so a non-coherent x86 aie2
+ * device the DMA layer mislabels as coherent still gets a real flush.
+ */
 static int amdxdna_flush_bo(struct amdxdna_gem_obj *abo, u64 offset, u64 size,
 			    enum dma_data_direction dir)
 {
@@ -1504,6 +1529,30 @@ static int amdxdna_flush_bo(struct amdxdna_gem_obj *abo, u64 offset, u64 size,
 		return 0;
 
 	return amdxdna_flush_bo_range(abo, offset, size, dir);
+}
+
+/*
+ * aie4 KMQ helper: cache-sync [offset, offset+size) of @abo (clamped) through
+ * the DMA API. Unlike amdxdna_flush_bo() it is never arch-gated -- both aie4
+ * transports report coherency accurately, so this is a runtime no-op on the
+ * coherent PCI part and a real flush on the non-coherent platform.
+ */
+int amdxdna_gem_dma_sync_range(struct amdxdna_gem_obj *abo, u64 offset, u64 size,
+			       enum dma_data_direction dir)
+{
+	u64 end;
+
+	if (offset >= abo->mem.size)
+		return -EINVAL;
+
+	if (check_add_overflow(offset, size, &end))
+		return -EINVAL;
+
+	size = min(abo->mem.size, end) - offset;
+	if (!size)
+		return 0;
+
+	return amdxdna_gem_dma_sync(abo, offset, size, dir);
 }
 
 /*
@@ -1551,7 +1600,8 @@ int amdxdna_drm_sync_bo_ioctl(struct drm_device *dev,
 			if (start >= end)
 				continue;
 
-			ret = amdxdna_flush_bo(heap, start - heap_start, end - start, dir);
+			ret = amdxdna_flush_bo(heap, start - heap_start,
+					       end - start, dir);
 			if (ret) {
 				XDNA_ERR(xdna, "Failed to flush heap %ld ret %d",
 					 heap_id, ret);
