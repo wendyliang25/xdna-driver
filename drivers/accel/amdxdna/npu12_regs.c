@@ -4,7 +4,9 @@
  */
 
 #include "drm/amdxdna_accel.h"
+#include <linux/bits.h>
 
+#include "aie4.h"
 #include "aie4_plat.h"
 #include "amdxdna_drv.h"
 #include "amdxdna_plat_drv.h"
@@ -23,16 +25,29 @@
  */
 
 /*
- * Firmware/CERT protocol version negotiation: advertise only the base
- * major/minimum-minor npu12 speaks. No optional feature bits are claimed.
+ * Firmware protocol version negotiation: advertise the base major/minimum-minor
+ * the NPU firmware speaks.
  */
 static const struct amdxdna_fw_feature_tbl npu12_fw_feature_table[] = {
 	{ .major = 6, .min_minor = 0 },
+	{ .features = BIT_U64(AIE4_GET_COREDUMP), .major = 6, .min_minor = 0 },
+	{ .features = BIT_U64(AIE4_RW_ACCESS), .major = 6, .min_minor = 0 },
+	{ .features = BIT_U64(AIE4_FW_LOG), .major = 6, .min_minor = 0 },
+	{ .features = BIT_U64(AIE4_FW_TRACE), .major = 6, .min_minor = 0 },
+	{ .features = BIT_U64(AIE4_CALIBRATE_CLOCK), .major = 6, .min_minor = 0 },
 	{ 0 }
 };
 
+/*
+ * CERT protocol negotiation: the expected HSA host-queue protocol version, same
+ * as the PCI npu3 CERT (1.0), with AIE4_HSA_COMMAND advertised at that version.
+ * The aie2ps CERT does not report its host-queue version yet (see the 0.0
+ * fallback in aie4_query_cert_firmware_version()); this table is the version the
+ * firmware is expected to speak once it does.
+ */
 static const struct amdxdna_fw_feature_tbl npu12_cert_feature_table[] = {
-	{ .major = 1, .min_minor = 6 },
+	{ .major = 1, .min_minor = 0 },
+	{ .features = BIT_U64(AIE4_HSA_COMMAND), .major = 1, .min_minor = 0 },
 	{ 0 }
 };
 
