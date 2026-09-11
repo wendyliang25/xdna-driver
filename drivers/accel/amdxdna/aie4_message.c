@@ -13,6 +13,7 @@
 
 #include "aie.h"
 #include "aie4.h"
+#include "aie4_host_queue.h"
 #include "aie4_msg_priv.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_mailbox.h"
@@ -129,6 +130,18 @@ int aie4_query_cert_firmware_version(struct amdxdna_dev_hdl *ndev,
 	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
 	if (ret)
 		return ret;
+
+	/*
+	 * The aie2ps (npu12) CERT does not report its HSA host-queue protocol
+	 * version yet -- the response leaves the field zero, so we read 0.0. Fall
+	 * back to the version this driver implements (HOST_QUEUE_*_VERSION) so the
+	 * protocol check can proceed; firmware that reports a real version is
+	 * unaffected. Drop this once the CERT populates host_queue_major/minor.
+	 */
+	if (!resp.host_queue_major && !resp.host_queue_minor) {
+		resp.host_queue_major = HOST_QUEUE_MAJOR_VERSION;
+		resp.host_queue_minor = HOST_QUEUE_MINOR_VERSION;
+	}
 
 	ret = aie_check_cert_protocol(&ndev->aie,
 				      resp.host_queue_major, resp.host_queue_minor);
