@@ -673,21 +673,24 @@ void *amdxdna_cbuf_kalloc(struct amdxdna_dev *xdna, size_t size, bool fw,
 }
 
 /*
- * Publish CPU writes to a cbuf-backed kernel buffer so the device sees them.
- * The CMA backing is dma_alloc_noncoherent() (cacheable), so a clean-to-DRAM is
- * required; the carveout backing is ioremap'd, flushed with drm_clflush like the
- * x86 bring-up path.  DMA_TO_DEVICE regardless of the buffer's streaming
- * direction: the caller has just written to it from the CPU.
+ * Cache-sync [offset, offset+size) of a cbuf-backed kernel buffer.  @dir is
+ * DMA_TO_DEVICE to publish CPU writes or DMA_FROM_DEVICE to drop stale lines
+ * before reading device-written data.  The CMA backing is dma_alloc_noncoherent()
+ * (cacheable), so it needs a real sync; the carveout backing is ioremap'd
+ * (uncached), so drm_clflush -- an x86-only, aarch64 no-op -- is enough.
  */
-void amdxdna_cbuf_ksync_for_device(void *cookie)
+void amdxdna_cbuf_ksync(void *cookie, u64 offset, u64 size,
+			enum dma_data_direction dir)
 {
 	struct amdxdna_cbuf_kbuf *kbuf = cookie;
 
 	if (kbuf->carveout)
-		drm_clflush_virt_range(kbuf->vaddr, kbuf->size);
+		drm_clflush_virt_range((u8 *)kbuf->vaddr + offset, size);
+	else if (dir == DMA_FROM_DEVICE)
+		dma_sync_single_for_cpu(kbuf->dev, kbuf->dma_addr + offset, size, dir);
 	else
-		dma_sync_single_for_device(kbuf->dev, kbuf->dma_addr, kbuf->size,
-					   DMA_TO_DEVICE);
+		dma_sync_single_for_device(kbuf->dev, kbuf->dma_addr + offset, size,
+					   dir);
 }
 
 void amdxdna_cbuf_kfree(void *cookie)

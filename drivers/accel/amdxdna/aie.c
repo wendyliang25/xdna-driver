@@ -254,7 +254,7 @@ int amdxdna_get_aie_status(struct aie_device *aie,
 		return PTR_ERR(buf_hdl);
 
 	memset(to_cpu_addr(buf_hdl, 0), 0, to_buf_size(buf_hdl));
-	drm_clflush_virt_range(to_cpu_addr(buf_hdl, 0), to_buf_size(buf_hdl));
+	amdxdna_msg_buff_sync_for_device(buf_hdl);
 
 	ret = aie->msg_ops.query_status(aie, buf_hdl, &cols_filled, &resp_size);
 	if (ret) {
@@ -270,7 +270,7 @@ int amdxdna_get_aie_status(struct aie_device *aie,
 	}
 
 	/* Invalidate stale cache lines before reading FW-written data. */
-	drm_clflush_virt_range(to_cpu_addr(buf_hdl, 0), to_buf_size(buf_hdl));
+	amdxdna_msg_buff_sync_for_cpu(buf_hdl);
 
 	resp_size = min(status.buffer_size, resp_size);
 	if (copy_to_user(u64_to_user_ptr(status.buffer),
@@ -499,26 +499,39 @@ void amdxdna_free_msg_buff(struct amdxdna_msg_buf_hdl *hdl)
 }
 
 /*
- * Publish CPU writes to a message buffer so the firmware sees them.  The cbuf
- * backing is synced against the bank device it was allocated on.  The other
- * backings (iova, plain SVA/PASID) hand back WB-cached memory from
+ * Cache-sync [offset, offset+size) of a message buffer so the firmware (or CERT
+ * shim DMA) and the CPU agree.  @dir is DMA_TO_DEVICE to publish CPU writes
+ * before arming firmware, or DMA_FROM_DEVICE to drop stale lines before reading
+ * device-written data.  The cbuf backing is synced against its bank device.
+ * The other backings (iova, plain SVA/PASID) hand back WB-cached memory from
  * __get_free_pages() / dma_alloc_noncoherent().  On x86 the streaming
  * dma_sync_*() helpers no-op because the NPU is reported dma-coherent, so flush
  * with drm_clflush -- which only exists on x86 anyway.  On non-x86, where
- * drm_clflush warns and no-ops, the plain path (the only non-cbuf backing there,
- * since the iova force-mapping is x86-only) uses dma_sync_single_for_device()
- * with DMA_TO_DEVICE -- a clean-to-DRAM (correct even though the streaming
- * direction is DMA_FROM_DEVICE, since the CPU has just written it) that no-ops
- * on the coherent aie4 platform.  Mirrors amdxdna_free_msg_buff()'s dispatch.
+ * drm_clflush warns and no-ops, use dma_sync_single_for_*(), which no-ops on the
+ * coherent aie4 platform.  Mirrors amdxdna_free_msg_buff()'s dispatch.
  */
-void amdxdna_msg_buff_sync_for_device(struct amdxdna_msg_buf_hdl *hdl)
+void amdxdna_msg_buff_sync(struct amdxdna_msg_buf_hdl *hdl, u64 offset, u64 size,
+			   enum dma_data_direction dir)
 {
 	if (hdl->cbuf)
-		amdxdna_cbuf_ksync_for_device(hdl->cbuf);
+		amdxdna_cbuf_ksync(hdl->cbuf, offset, size, dir);
 	else if (IS_ENABLED(CONFIG_X86))
-		drm_clflush_virt_range(hdl->vaddr, hdl->size);
+		drm_clflush_virt_range(to_cpu_addr(hdl, offset), size);
+	else if (dir == DMA_FROM_DEVICE)
+		dma_sync_single_for_cpu(hdl->xdna->ddev.dev, to_dma_addr(hdl, offset),
+					size, dir);
 	else
-		dma_sync_single_for_device(hdl->xdna->ddev.dev, hdl->dma_addr,
-					   hdl->size, DMA_TO_DEVICE);
+		dma_sync_single_for_device(hdl->xdna->ddev.dev, to_dma_addr(hdl, offset),
+					   size, dir);
+}
+
+void amdxdna_msg_buff_sync_for_device(struct amdxdna_msg_buf_hdl *hdl)
+{
+	amdxdna_msg_buff_sync(hdl, 0, to_buf_size(hdl), DMA_TO_DEVICE);
+}
+
+void amdxdna_msg_buff_sync_for_cpu(struct amdxdna_msg_buf_hdl *hdl)
+{
+	amdxdna_msg_buff_sync(hdl, 0, to_buf_size(hdl), DMA_FROM_DEVICE);
 }
 
