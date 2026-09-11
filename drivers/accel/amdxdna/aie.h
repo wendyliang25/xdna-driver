@@ -198,6 +198,7 @@ struct amdxdna_msg_buf_hdl {
 struct amdxdna_msg_buf_hdl *amdxdna_alloc_msg_buff(struct amdxdna_dev *xdna, u32 size,
 						   bool fw);
 void amdxdna_free_msg_buff(struct amdxdna_msg_buf_hdl *hdl);
+void amdxdna_msg_buff_sync_for_device(struct amdxdna_msg_buf_hdl *hdl);
 
 /* aie_psp.c */
 struct psp_device *aiem_psp_create(struct drm_device *ddev, struct psp_config *conf);
