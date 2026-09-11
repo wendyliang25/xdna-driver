@@ -22,6 +22,7 @@
 #include "aie4_plat.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_drv.h"
+#include "amdxdna_error.h"
 #include "amdxdna_mailbox.h"
 #include "amdxdna_mailbox_plat.h"
 
@@ -87,9 +88,80 @@ void aie4_update_counters(struct amdxdna_dev_hdl *ndev)
 
 /* Device lifecycle (platform variants of the aie4_classic_* lifecycle). */
 
+/*
+ * Bring up the shmem+IPI mailbox and its management channel.  This is the
+ * platform counterpart of the PCI aie4_mailbox_init(): the ring buffers and IPI
+ * come from the device tree (parsed in xdnam_mailbox_create()), so there are no
+ * PCI ring resources or MSI-X irq to wire, and xdna_mailbox_start_channel() is a
+ * no-op on this transport.  The mailbox itself is drm-managed (auto-freed);
+ * aie4_mailbox_fini() only tears the channel back down.
+ */
+static int aie4_mailbox_init(struct amdxdna_dev_hdl *ndev)
+{
+	struct amdxdna_dev *xdna = ndev->aie.xdna;
+	int ret;
+
+	ndev->mbox = xdnam_mailbox_create(&xdna->ddev, NULL);
+	if (!ndev->mbox) {
+		XDNA_ERR(xdna, "failed to create mailbox device");
+		return -ENODEV;
+	}
+
+	ndev->aie.mgmt_chann = xdna_mailbox_alloc_channel(ndev->mbox);
+	if (!ndev->aie.mgmt_chann) {
+		XDNA_ERR(xdna, "failed to alloc mailbox channel");
+		return -ENODEV;
+	}
+
+	/* Firmware-initiated (async) messages arrive with mailbox id 0. */
+	xdna_mailbox_set_async_cb(ndev->aie.mgmt_chann, ndev,
+				  aie4_mgmt_async_event_handler);
+
+	ret = xdna_mailbox_start_channel(ndev->aie.mgmt_chann, NULL, NULL, 0, 0);
+	if (ret) {
+		xdna_mailbox_free_channel(ndev->aie.mgmt_chann);
+		ndev->aie.mgmt_chann = NULL;
+	}
+	return ret;
+}
+
+static void aie4_mailbox_fini(struct amdxdna_dev_hdl *ndev)
+{
+	if (!ndev->aie.mgmt_chann)
+		return;
+
+	xdna_mailbox_stop_channel(ndev->aie.mgmt_chann);
+	xdna_mailbox_free_channel(ndev->aie.mgmt_chann);
+	ndev->aie.mgmt_chann = NULL;
+}
+
+/*
+ * Platform equivalent of the PCI aie4_config_fw(): calibrate the clock, attach
+ * the DRAM work buffer and apply the context-switch hysteresis.  (The PCI-only
+ * NPU3A iommu-bypass echo does not apply here.)
+ */
+static int aie4_plat_config_fw(struct amdxdna_dev_hdl *ndev)
+{
+	int ret;
+
+	ret = aie4_calibrate_clock(ndev);
+	if (ret)
+		return ret;
+
+	ret = aie4_attach_work_buffer(ndev, to_dma_addr(ndev->work_buf_hdl, 0),
+				      to_buf_size(ndev->work_buf_hdl));
+	if (ret)
+		return ret;
+
+	/* Best-effort tuning knob; failure warns internally, does not fail init. */
+	aie4_set_ctx_hysteresis(ndev, ndev->ctx_switch_hysteresis_us);
+	return 0;
+}
+
 static int aie4_plat_init(struct amdxdna_dev *xdna)
 {
 	struct amdxdna_dev_hdl *ndev;
+	int ret;
 
 	ndev = drmm_kzalloc(&xdna->ddev, sizeof(*ndev), GFP_KERNEL);
 	if (!ndev)
@@ -99,26 +171,55 @@ static int aie4_plat_init(struct amdxdna_dev *xdna)
 	xdna->dev_handle = ndev;
 
 	/*
-	 * The platform mailbox is the shmem+IPI implementation of struct mailbox
-	 * (amdxdna_mailbox_plat.c); it derives its regions/IPI from device tree,
-	 * so the PCI-oriented xdna_mailbox_res is unused and passed as NULL.  It
-	 * is drm-managed, so aie4_plat_fini() needs no explicit teardown.
+	 * Bring the device up the same way aie4_classic_hw_start() does, minus the
+	 * PCI-only firmware load: the RPU self-boots its CERT firmware, so there is
+	 * no aie_smu/aie_psp step.  Create the mailbox + management channel, then run
+	 * the shared aie4 handshake -- query_fw negotiates the feature set (this is
+	 * what turns on AIE4_HSA_COMMAND that aie4_hwctx_init() requires), config_fw
+	 * calibrates the clock and attaches the work buffer, and setup_aie brings up
+	 * the AIE partition.
 	 */
-	ndev->mbox = xdnam_mailbox_create(&xdna->ddev, NULL);
-	if (!ndev->mbox)
-		return -ENODEV;
+	ret = aie4_alloc_work_buffer(ndev);
+	if (ret)
+		return ret;
 
-	/*
-	 * TODO: alloc/start the mgmt mailbox_channel and run the shared aie4
-	 * bring-up (aie4_query_fw/aie4_setup_aie plus the common DRM/context
-	 * init), mirroring aie4_classic_init().
-	 */
+	ret = aie4_mailbox_init(ndev);
+	if (ret)
+		goto free_work_buf;
+
+	ret = aie4_query_fw(ndev);
+	if (ret)
+		goto mbox_fini;
+
+	ret = aie4_plat_config_fw(ndev);
+	if (ret)
+		goto mbox_fini;
+
+	ret = aie4_setup_aie(ndev);
+	if (ret)
+		goto mbox_fini;
+
 	return 0;
+
+mbox_fini:
+	aie4_mailbox_fini(ndev);
+free_work_buf:
+	aie4_free_work_buffer(ndev);
+	return ret;
 }
 
 static void aie4_plat_fini(struct amdxdna_dev *xdna)
 {
-	/* TODO: aie4_partition_fini(). The mailbox is drm-managed (auto-freed). */
+	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
+
+	aie4_partition_fini(ndev);
+	aie4_mailbox_fini(ndev);
+	/*
+	 * Free the async pool after the mailbox is torn down so channel teardown
+	 * cannot fire the async callback on freed event slots (see aie4_vf_hw_stop).
+	 */
+	amdxdna_async_events_free(&ndev->aie);
+	aie4_free_work_buffer(ndev);
 }
 
 static int aie4_plat_suspend(struct amdxdna_dev *xdna)
