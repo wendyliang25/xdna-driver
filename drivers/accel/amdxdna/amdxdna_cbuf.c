@@ -3,6 +3,7 @@
  * Copyright (C) 2026, Advanced Micro Devices, Inc.
  */
 
+#include <drm/drm_cache.h>
 #include <drm/drm_mm.h>
 #include <drm/drm_prime.h>
 #include <linux/dma-buf.h>
@@ -669,6 +670,24 @@ void *amdxdna_cbuf_kalloc(struct amdxdna_dev *xdna, size_t size, bool fw,
 	*vaddr = kbuf->vaddr;
 	*dma_addr = kbuf->dma_addr;
 	return kbuf;
+}
+
+/*
+ * Publish CPU writes to a cbuf-backed kernel buffer so the device sees them.
+ * The CMA backing is dma_alloc_noncoherent() (cacheable), so a clean-to-DRAM is
+ * required; the carveout backing is ioremap'd, flushed with drm_clflush like the
+ * x86 bring-up path.  DMA_TO_DEVICE regardless of the buffer's streaming
+ * direction: the caller has just written to it from the CPU.
+ */
+void amdxdna_cbuf_ksync_for_device(void *cookie)
+{
+	struct amdxdna_cbuf_kbuf *kbuf = cookie;
+
+	if (kbuf->carveout)
+		drm_clflush_virt_range(kbuf->vaddr, kbuf->size);
+	else
+		dma_sync_single_for_device(kbuf->dev, kbuf->dma_addr, kbuf->size,
+					   DMA_TO_DEVICE);
 }
 
 void amdxdna_cbuf_kfree(void *cookie)
