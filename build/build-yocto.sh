@@ -14,7 +14,7 @@
 #   ./build/build-yocto.sh [-b <yocto-build-dir>] [-m] [-s] [-c] [-h]
 #     -b   path to the Yocto build dir (the one containing tmp/, conf/, ...)
 #     -m   build only the amdxdna kernel module
-#     -s   build only the shim/xrt tests
+#     -s   build only the userspace packages (shim + shim tests + xrt runtime)
 #     -c   clean build artifacts first
 #     (no flag) build both
 #
@@ -84,11 +84,38 @@ build_module() {
   need_dir "$MOD_NATIVE/usr/bin/aarch64-amd-linux" \
     "module cross toolchain (run: bitbake amdxdna -c prepare_recipe_sysroot)"
 
+  # Choose KBUILD_OUTPUT carefully to avoid a vermagic mismatch.
+  #
+  # The shared kernel-build-artifacts ($KART) can carry a spurious '+' in its
+  # kernel release (e.g. '6.18.10-xilinx+'): Yocto's do_shared_workdir
+  # regenerates utsrelease.h without the kernel's .scmversion, so
+  # scripts/setlocalversion appends '+' for an untagged tree.  A module built
+  # against it gets vermagic '6.18.10-xilinx+', which the deployed kernel
+  # ('6.18.10-xilinx') rejects at insmod:
+  #   version magic '...-xilinx+ ...' should be '...-xilinx ...'
+  #
+  # The linux-xlnx recipe's own standard-build dir has the CORRECT (no '+')
+  # utsrelease.h -- the exact build that produced the deployed Image -- plus a
+  # matching Module.symvers.  Prefer it; fall back to $KART otherwise.
+  local KREC KOUT KREL
+  KREC="$(ls -d ${TMP}/work/amd_cortexa78_mali_common-amd-linux/linux-xlnx/*/linux-*-standard-build 2>/dev/null | head -1)"
+  if [ -n "${KREC}" ] && [ -f "${KREC}/include/generated/utsrelease.h" ] \
+     && [ -f "${KREC}/Module.symvers" ]; then
+    KOUT="${KREC}"
+    log "KBUILD_OUTPUT = linux-xlnx recipe build dir (matches deployed Image)"
+  else
+    KOUT="${KART}"
+    warn "recipe kernel build dir not found; falling back to shared artifacts:"
+    warn "  ${KART}"
+    warn "  module vermagic may get a spurious '+'; if insmod complains, rebuild"
+    warn "  the kernel (bitbake virtual/kernel) and re-run this script."
+  fi
+  KREL="$(cat "${KOUT}/include/config/kernel.release" 2>/dev/null || true)"
+  log "target kernel release (expected vermagic): ${KREL:-unknown}"
+
   # Cross toolchain on PATH; split source/output kernel via KBUILD_OUTPUT.
-  # (We never modify the shared kernel-build-artifacts; it is expected to be
-  # already prepared for external modules by the Yocto kernel build.)
   export PATH="${MOD_NATIVE}/usr/bin/aarch64-amd-linux:${PATH}"
-  export KBUILD_OUTPUT="${KART}"
+  export KBUILD_OUTPUT="${KOUT}"
 
   # Build entirely out-of-source: mirror the driver + include/ into
   # build-yocto/kmod and build there, so the source tree
@@ -121,7 +148,7 @@ build_module() {
     # the kernel lacks it, provide a weak fake in the (generated, mirror-only)
     # config_kernel.h so the module still links; the userptr/HMM fault path
     # then returns an error instead of resolving pages.  Source tree untouched.
-    if ! grep -q '^CONFIG_HMM_MIRROR=y' "${KART}/.config" 2>/dev/null; then
+    if ! grep -q '^CONFIG_HMM_MIRROR=y' "${KOUT}/.config" 2>/dev/null; then
       log "kernel has no CONFIG_HMM_MIRROR; adding fake hmm_range_fault to config_kernel.h"
       cat >> "${drvdir}/config_kernel.h" <<'EOF'
 
@@ -156,14 +183,28 @@ EOF
   mkdir -p "${OUT_DIR}"
   cp -f "$ko" "${OUT_DIR}/amdxdna.ko"
   log "amdxdna.ko -> ${OUT_DIR}/amdxdna.ko"
+
+  # Sanity: the module's vermagic must match the deployed kernel's release, or
+  # insmod rejects it ("version magic ... should be ...").  Compare and warn.
+  if command -v modinfo >/dev/null 2>&1; then
+    local vm
+    vm="$(modinfo -F vermagic "${OUT_DIR}/amdxdna.ko" 2>/dev/null | awk '{print $1}')"
+    if [ -n "${vm}" ] && [ -n "${KREL}" ] && [ "${vm}" != "${KREL}" ]; then
+      warn "vermagic mismatch: module '${vm}' vs kernel '${KREL}'"
+      warn "  the .ko will NOT load on a '${KREL}' kernel."
+    else
+      log "vermagic OK: ${vm:-unknown} (matches kernel ${KREL:-unknown})"
+    fi
+  fi
   unset KBUILD_OUTPUT
 }
 
 # ---------------------------------------------------------------------------
-# Userspace tests: shim_test.elf / xrt_test.elf
+# Userspace packages: shim (libxrt_driver_xdna.so), shim tests
+# (shim_test.elf / xrt_test.elf) and the xrt runtime (xrt-smi + core libs).
 # ---------------------------------------------------------------------------
 build_shim_test() {
-  log "Building shim_test.elf / xrt_test.elf against Yocto rootfs sysroot"
+  log "Building shim + shim tests against Yocto rootfs sysroot"
   need_dir "$SHIM_SYSROOT" \
     "shim target sysroot (run: bitbake xdna-shim-test -c prepare_recipe_sysroot)"
   need_dir "$SHIM_NATIVE" "shim native sysroot"
@@ -193,13 +234,46 @@ Run: bitbake xdna-shim-test -c configure   (to (re)generate it)"
     -Wno-dev \
     -S "${SRC_ROOT}" -B "${bdir}"
 
-  make -C "${bdir}" -j"$(nproc)" shim_test.elf xrt_test.elf
+  # Build the shim (xrt_driver_xdna) and its private xrt_core/xrt_coreutil, plus
+  # the two test ELFs.  Building the ELFs alone would pull the libs in as deps,
+  # but naming them explicitly keeps -s meaningful if the tests are ever dropped.
+  make -C "${bdir}" -j"$(nproc)" \
+    xrt_coreutil xrt_core xrt_driver_xdna shim_test.elf xrt_test.elf
 
-  mkdir -p "${OUT_DIR}"
-  cp -f "${bdir}/test/shim_test/shim_test.elf" "${OUT_DIR}/shim_test.elf"
-  cp -f "${bdir}/test/xrt_test/xrt_test.elf"   "${OUT_DIR}/xrt_test.elf"
-  [ -f "${bdir}/test/xrt_test/xrt_test" ] && cp -f "${bdir}/test/xrt_test/xrt_test" "${OUT_DIR}/xrt_test" || true
-  log "shim_test.elf / xrt_test.elf -> ${OUT_DIR}/"
+  # Collect the deployable userspace set into OUT_DIR, grouped per component so
+  # it mirrors the Yocto packages (xdna-shim / xdna-shim-test / xrt):
+  #   shim/       libxrt_driver_xdna.so*   built from THIS checkout (local changes)
+  #   shim_test/  shim_test.elf xrt_test.elf xrt_test
+  #   xrt/        xrt-smi libxrt_core.so* libxrt_coreutil.so*
+  # The shim's DT_NEEDED lists libxrt_core.so.2 / libxrt_coreutil.so.2, which the
+  # upstream xrt recipe (not xdna-shim) ships, so include them for a self-
+  # contained drop.  cp -a preserves the .so soname symlink chain.
+  mkdir -p "${OUT_DIR}/shim" "${OUT_DIR}/shim_test" "${OUT_DIR}/xrt"
+
+  cp -a "${bdir}"/src/shim/libxrt_driver_xdna.so* "${OUT_DIR}/shim/"
+
+  cp -f "${bdir}/test/shim_test/shim_test.elf" "${OUT_DIR}/shim_test/shim_test.elf"
+  cp -f "${bdir}/test/xrt_test/xrt_test.elf"   "${OUT_DIR}/shim_test/xrt_test.elf"
+  [ -f "${bdir}/test/xrt_test/xrt_test" ] && \
+    cp -f "${bdir}/test/xrt_test/xrt_test" "${OUT_DIR}/shim_test/xrt_test" || true
+
+  # xrt-smi + xrt runtime libs come from the (upstream) xrt recipe image, not
+  # this tree.  Fall back with a warning if xrt hasn't been built yet.
+  local xrt_img
+  xrt_img="$(ls -d ${TMP}/work/${USERSPACE_TUNE}/xrt/*/image 2>/dev/null | head -1)"
+  if [ -n "${xrt_img}" ] && [ -d "${xrt_img}" ]; then
+    cp -f "${xrt_img}/usr/bin/xrt-smi" "${OUT_DIR}/xrt/" 2>/dev/null || \
+      warn "xrt-smi not found under ${xrt_img}/usr/bin"
+    cp -a "${xrt_img}"/usr/lib/libxrt_core.so*     "${OUT_DIR}/xrt/" 2>/dev/null || true
+    cp -a "${xrt_img}"/usr/lib/libxrt_coreutil.so* "${OUT_DIR}/xrt/" 2>/dev/null || true
+  else
+    warn "xrt recipe image dir not found under ${TMP}/work/${USERSPACE_TUNE}/xrt/*/image"
+    warn "  run: MACHINE=${KERNEL_MACHINE} bitbake xrt   (then re-run -s); skipping xrt"
+  fi
+
+  log "shim      -> ${OUT_DIR}/shim/       (libxrt_driver_xdna.so)"
+  log "shim_test -> ${OUT_DIR}/shim_test/  (shim_test.elf, xrt_test.elf)"
+  log "xrt       -> ${OUT_DIR}/xrt/        (xrt-smi, libxrt_core.so, libxrt_coreutil.so)"
 }
 
 do_clean() {
@@ -232,4 +306,4 @@ log "YOCTO_BUILD= ${YOCTO_BUILD}"
 [ $do_shim -eq 1 ] && build_shim_test
 
 log "Done. Artifacts in ${OUT_DIR}"
-ls -l "${OUT_DIR}" 2>/dev/null || true
+ls -lR "${OUT_DIR}" 2>/dev/null || true
