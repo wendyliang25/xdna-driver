@@ -261,7 +261,7 @@ int aie4_start_fw_trace(struct amdxdna_dev_hdl *ndev,
 			u32 categories, u32 *msi_idx, u32 *msi_address);
 
 /* aie4.c transport-independent query/policy helpers. */
-int aie4_partition_init(struct amdxdna_dev_hdl *ndev);
+int aie4_partition_init(struct amdxdna_dev_hdl *ndev, u32 col_count);
 void aie4_partition_fini(struct amdxdna_dev_hdl *ndev);
 void aie4_restore_power_mode(struct amdxdna_dev_hdl *ndev);
 void aie4_restore_force_preemption(struct amdxdna_dev_hdl *ndev);

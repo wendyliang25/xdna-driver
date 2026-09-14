@@ -206,7 +206,7 @@ static void aie4_plat_fini(struct amdxdna_dev *xdna)
 {
 	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
 
-	aie4_partition_fini(ndev);
+	/* The partition is per hwctx now (aie4_hwctx_create), none to fini here. */
 	aie4_mailbox_fini(ndev);
 	/*
 	 * Free the async pool after the mailbox is torn down so channel teardown
