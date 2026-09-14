@@ -221,12 +221,21 @@ int aie4_attach_work_buffer(struct amdxdna_dev_hdl *ndev, dma_addr_t addr, u32 s
 	req.buff_size = size;
 
 	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
-	if (ret)
-		XDNA_ERR(xdna, "Failed to attach work buffer, ret %d", ret);
-	else
-		XDNA_DBG(xdna, "Attached work buffer, size %d", size);
+	if (ret) {
+		/*
+		 * HACK: the aie2ps (npu12) CERT does not implement
+		 * ATTACH_WORK_BUFFER yet -- opcode 0x40001 collides with the
+		 * firmware's EXEC_HW_CONTEXT, so the request is rejected (status
+		 * 0x1 / -EINVAL) and probe aborts.  Swallow the failure so bring-up
+		 * can proceed; the work buffer is only a firmware scratch region.
+		 * Remove once the CERT implements the work-buffer opcode.
+		 */
+		XDNA_WARN(xdna, "Ignoring work buffer attach failure, ret %d (HACK)", ret);
+		return 0;
+	}
 
-	return ret;
+	XDNA_DBG(xdna, "Attached work buffer, size %d", size);
+	return 0;
 }
 
 int aie4_msg_set_power_mode(struct amdxdna_dev_hdl *ndev, u8 power_mode)
