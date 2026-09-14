@@ -29,14 +29,14 @@
 
 #define AIE4_TOTAL_COLUMN	3
 
-int aie4_partition_init(struct amdxdna_dev_hdl *ndev)
+int aie4_partition_init(struct amdxdna_dev_hdl *ndev, u32 col_count)
 {
 	DECLARE_AIE_MSG(aie4_msg_create_partition, AIE4_MSG_OP_CREATE_PARTITION);
 	struct amdxdna_dev *xdna = ndev->aie.xdna;
 	int ret;
 
 	req.partition_col_start = 0;
-	req.partition_col_count = AIE4_TOTAL_COLUMN;
+	req.partition_col_count = col_count;
 	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
 	if (ret) {
 		XDNA_ERR(xdna, "partition init failed: %d", ret);
@@ -181,21 +181,18 @@ int aie4_setup_aie(struct amdxdna_dev_hdl *ndev)
 		/* if query dpm from fw failed, using default value */
 		(void)aie4_set_dpm(ndev, 0);
 
-	ret = aie4_partition_init(ndev);
-	if (ret)
-		return ret;
-
+	/*
+	 * The AIE partition is created per hwctx (aie4_hwctx_create) on this
+	 * platform, not device-wide here, so probe does not depend on the firmware
+	 * being ready for CREATE_PARTITION.
+	 */
 	ret = amdxdna_async_events_alloc(&ndev->aie, ndev->total_col);
 	if (ret) {
 		XDNA_ERR(ndev->aie.xdna, "Allocate async events failed, ret %d", ret);
-		goto partition_fini;
+		return ret;
 	}
 
 	return 0;
-
-partition_fini:
-	aie4_partition_fini(ndev);
-	return ret;
 }
 
 static int aie4_get_power_mode(struct amdxdna_client *client,
