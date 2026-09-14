@@ -142,6 +142,13 @@ struct amdxdna_dev_info {
 	const struct amdxdna_fw_feature_tbl *cert_feature_tbl;
 	const struct amdxdna_dev_ops	*ops;
 
+	/*
+	 * Create the AIE partition per hwctx (aie4_hwctx_create) rather than
+	 * device-wide at probe (aie4_setup_aie).  Set for the platform aie2ps
+	 * (npu12), whose firmware owns a partition per context.
+	 */
+	bool				partition_per_hwctx;
+
 	/* Asynchronous error reporting data (per AIE generation). */
 	const struct aie_error_lut_set	*luts;
 	u32				async_max_status_code;
