@@ -396,14 +396,14 @@ static int aie4_fw_load(struct amdxdna_dev_hdl *ndev)
 	return ret;
 }
 
-int aie4_partition_init(struct amdxdna_dev_hdl *ndev)
+int aie4_partition_init(struct amdxdna_dev_hdl *ndev, u32 col_count)
 {
 	DECLARE_AIE_MSG(aie4_msg_create_partition, AIE4_MSG_OP_CREATE_PARTITION);
 	struct amdxdna_dev *xdna = ndev->aie.xdna;
 	int ret;
 
 	req.partition_col_start = 0;
-	req.partition_col_count = AIE4_TOTAL_COLUMN;
+	req.partition_col_count = col_count;
 	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
 	if (ret) {
 		XDNA_ERR(xdna, "partition init failed: %d", ret);
@@ -579,7 +579,7 @@ int aie4_setup_aie(struct amdxdna_dev_hdl *ndev)
 		/* if query dpm from fw failed, using default value */
 		(void)ndev->priv->hw_ops->set_dpm(&ndev->aie, 0);
 
-	ret = aie4_partition_init(ndev);
+	ret = aie4_partition_init(ndev, AIE4_TOTAL_COLUMN);
 	if (ret)
 		return ret;
 
