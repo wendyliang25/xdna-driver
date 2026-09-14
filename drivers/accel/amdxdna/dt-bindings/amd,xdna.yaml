@@ -53,27 +53,40 @@ properties:
       - const: rx
 
   memory-region:
-    minItems: 2
-    maxItems: 11
+    minItems: 4
+    maxItems: 10
     description: |
       Phandles to reserved-memory regions, matched by name via
-      memory-region-names.  "mgmt"/"doorbell" are predefined-layout regions
-      accessed only by the CPU (ioremap).  "fw" and "aie<N>" are reusable
-      shared-dma-pool regions the driver allocates cacheable, software-coherent
-      DMA buffers from with dma_alloc (see memory-region-names).
+      memory-region-names.  Required names are "mgmt", "doorbell", "fw", and
+      "aie0".  "mgmt"/"doorbell" are predefined-layout transport regions
+      accessed only by the CPU (ioremap), not allocator pools.  "fw" and
+      "aie<N>" are reusable shared-dma-pool regions the driver allocates
+      cacheable, software-coherent DMA buffers from with dma_alloc (see
+      memory-region-names).  Do not rely on implicit driver fallback banks.
 
   memory-region-names:
-    minItems: 2
-    maxItems: 11
+    minItems: 4
+    maxItems: 10
+    uniqueItems: true
     description: |
       Names of the memory-region phandles.  Required: "mgmt", "doorbell".
-      Optional DMA pools: "fw" (firmware-visible; place its reserved-memory
-      below 4 GB, as the firmware processor reaches only 32-bit) and "aie<N>"
-      (AIE/CERT pools).  All pools are DMA-mapped through this device.  The
-      driver maps these to fixed userspace bank ids used in the create-BO
-      flags: "fw" -> 0, "aie<N>" -> N + 1.
+      "fw" and "aie0" are also required.  "fw" is firmware-visible and its
+      reserved-memory must be placed below 4 GB when firmware reaches only
+      32-bit DMA addresses.  "aie<N>" are AIE/CERT pools and may reside above
+      4 GB if the platform addressing allows it.  All pools are DMA-mapped
+      through this device.  The driver maps these to fixed userspace bank ids
+      used in the create-BO flags: "fw" -> 0, "aie<N>" -> N + 1.
     items:
       enum: [mgmt, doorbell, fw, aie0, aie1, aie2, aie3, aie4, aie5, aie6]
+    allOf:
+      - contains:
+          const: mgmt
+      - contains:
+          const: doorbell
+      - contains:
+          const: fw
+      - contains:
+          const: aie0
 
   iommus:
     maxItems: 1
@@ -132,14 +145,15 @@ examples:
             };
 
             /* firmware-visible pool, placed < 4 GB for the 32-bit RPU;
-             * cacheable, software-coherent (allocated with dma_alloc). */
+             * cacheable, software-coherent (allocated with dma_alloc).
+             * Keep this pool separate from AIE pools. */
             rpu_cma: rpu-cma@70000000 {
                 compatible = "shared-dma-pool";
                 reg = <0x0 0x70000000 0x0 0x4000000>;
                 reusable;
             };
 
-            /* AIE/CERT DMA pool (cacheable, software-coherent) */
+            /* AIE/CERT DMA pool (cacheable, software-coherent, can be > 4 GB) */
             aie_cma0: aie-cma@800000000 {
                 compatible = "shared-dma-pool";
                 reg = <0x8 0x00000000 0x0 0x40000000>;
