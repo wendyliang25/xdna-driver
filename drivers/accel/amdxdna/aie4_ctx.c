@@ -152,6 +152,38 @@ static u32 aie4_parse_priority_to_dev(u32 priority)
 	}
 }
 
+/*
+ * Parts with dev_info->partition_per_hwctx (the platform npu12) create and own
+ * an AIE partition per hwctx here, rather than sharing the device-wide partition
+ * that other parts set up once in aie4_setup_aie().  ndev->partition_id is
+ * device-level, so this assumes a single active hwctx at a time -- sufficient
+ * for platform bring-up.
+ */
+static int aie4_hwctx_partition_init(struct amdxdna_hwctx *hwctx)
+{
+	struct amdxdna_dev_hdl *ndev = hwctx->client->xdna->dev_handle;
+	u32 core_rows, col_count;
+
+	if (!hwctx->client->xdna->dev_info->partition_per_hwctx)
+		return 0;
+
+	/*
+	 * Size the partition to the columns this hwctx asked for.  num_tiles is
+	 * the requested column count times the core-tile rows per column (the
+	 * shim computes n_cols * core_rows), so divide it back out.
+	 */
+	core_rows = ndev->aie.metadata.core.row_count;
+	col_count = core_rows ? hwctx->num_tiles / core_rows : hwctx->num_tiles;
+
+	return aie4_partition_init(ndev, col_count);
+}
+
+static void aie4_hwctx_partition_fini(struct amdxdna_dev_hdl *ndev)
+{
+	if (ndev->aie.xdna->dev_info->partition_per_hwctx)
+		aie4_partition_fini(ndev);
+}
+
 int aie4_hwctx_create(struct amdxdna_hwctx *hwctx)
 {
 	DECLARE_AIE_MSG(aie4_msg_create_hw_context, AIE4_MSG_OP_CREATE_HW_CONTEXT);
@@ -164,10 +196,19 @@ int aie4_hwctx_create(struct amdxdna_hwctx *hwctx)
 
 	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
 
-	if (!ndev->partition_id || !hwctx->num_tiles) {
-		XDNA_ERR(xdna, "invalid request partition_id %u, num_tiles %d",
-			 ndev->partition_id, hwctx->num_tiles);
+	if (!hwctx->num_tiles) {
+		XDNA_ERR(xdna, "invalid request num_tiles %d", hwctx->num_tiles);
 		return -EINVAL;
+	}
+
+	ret = aie4_hwctx_partition_init(hwctx);
+	if (ret)
+		return ret;
+
+	if (!ndev->partition_id) {
+		XDNA_ERR(xdna, "invalid partition_id %u", ndev->partition_id);
+		ret = -EINVAL;
+		goto err_partition;
 	}
 
 	req.partition_id = ndev->partition_id;
@@ -183,7 +224,7 @@ int aie4_hwctx_create(struct amdxdna_hwctx *hwctx)
 	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
 	if (ret) {
 		XDNA_ERR(xdna, "create ctx failed: %d", ret);
-		return ret;
+		goto err_partition;
 	}
 
 	XDNA_DBG(xdna, "resp msix: %d, ctx id: %d, doorbell: %d",
@@ -194,7 +235,8 @@ int aie4_hwctx_create(struct amdxdna_hwctx *hwctx)
 	cert_comp = aie4_lookup_cert_comp(ndev, resp.job_complete_msix_idx);
 	if (IS_ERR(cert_comp)) {
 		aie4_msg_destroy_context(ndev, resp.hw_context_id);
-		return PTR_ERR(cert_comp);
+		ret = PTR_ERR(cert_comp);
+		goto err_partition;
 	}
 
 	priv->hw_ctx_id = resp.hw_context_id;
@@ -235,7 +277,7 @@ int aie4_hwctx_create(struct amdxdna_hwctx *hwctx)
 			/* Match a clean teardown so a later fini does not re-destroy. */
 			priv->hw_ctx_id = CTX_INVALID_ID;
 			hwctx->fw_ctx_id = -1;
-			return ret;
+			goto err_partition;
 		}
 		WRITE_ONCE(priv->has_reset, false);
 		/*
@@ -261,6 +303,10 @@ int aie4_hwctx_create(struct amdxdna_hwctx *hwctx)
 	}
 
 	return 0;
+
+err_partition:
+	aie4_hwctx_partition_fini(ndev);
+	return ret;
 }
 
 /*
@@ -329,8 +375,11 @@ void aie4_hwctx_destroy(struct amdxdna_hwctx *hwctx, enum aie4_hwctx_flags flags
 	if (priv->kernel_submit && has_reset)
 		wake_up_all(&priv->job_list_wq);
 
-	if (flags != AIE4_HWCTX_DISCONNECT)
+	if (flags != AIE4_HWCTX_DISCONNECT) {
 		aie4_msg_destroy_context(ndev, priv->hw_ctx_id);
+		/* Tear down the per-hwctx partition created in aie4_hwctx_create(). */
+		aie4_hwctx_partition_fini(ndev);
+	}
 
 	priv->hw_ctx_id = CTX_INVALID_ID;
 	hwctx->fw_ctx_id = -1;
