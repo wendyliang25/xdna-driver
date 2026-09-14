@@ -1122,6 +1122,17 @@ static int submit_one_cmd(struct amdxdna_hwctx *hwctx,
 					    offsetof(struct amdxdna_cmd, header);
 	/* Clean the packet slot (direct ebuf or indirect entries) before the doorbell. */
 	sync_umq_range(priv, pkt, sizeof(*pkt), DMA_TO_DEVICE);
+	/*
+	 * On a non-coherent device CERT reports completion by DMA-writing the
+	 * command state to cmd_abo (completion_signal, above).  User space filled
+	 * the command through a cacheable mapping, leaving the state header line
+	 * dirty; a later CPU write-back would land on top of CERT's result and the
+	 * shim would read a stale NEW state.  Clean the cmd BO to DRAM now (before
+	 * the doorbell) so the line is clean and eviction cannot clobber CERT.
+	 * No-op on the coherent PCI part.
+	 */
+	if (!aie4_dev_coherent(xdna))
+		sync_cmd_for_device(cmd_abo);
 	ri = get_read_index(hwctx);
 	*seq = publish_cmd(hwctx);
 	aie4_doorbell_ring(hwctx);
