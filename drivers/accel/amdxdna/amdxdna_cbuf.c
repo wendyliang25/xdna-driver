@@ -868,10 +868,10 @@ static int amdxdna_bank_ensure(struct amdxdna_dev *xdna, u32 id, bool fw)
 /*
  * Bind the memory banks from the amdxdna node's memory-region-names. "fw" is the
  * firmware bank (id AMDXDNA_MEM_BANK_FW, whose region must be placed below 4 GB);
- * "aie<N>" are the app banks (ids AMDXDNA_MEM_BANK_AIE + N). Other names (mgmt,
- * doorbell, ...) are ignored here. On the OF platform the firmware bank and the
- * first app bank are always available: any bank the DT did not name defaults to
- * system CMA on this device.
+ * "aie" is the app bank (id AMDXDNA_MEM_BANK_AIE). Other names (mgmt, doorbell,
+ * ...) are ignored here. On the OF platform the firmware bank and the app bank
+ * are always available: any bank the DT did not name defaults to system CMA on
+ * this device.
  */
 int amdxdna_mem_banks_init(struct amdxdna_dev *xdna, struct device_node *np)
 {
@@ -900,6 +900,8 @@ int amdxdna_mem_banks_init(struct amdxdna_dev *xdna, struct device_node *np)
 		if (!strcmp(name, "fw")) {
 			fw = true;
 			id = AMDXDNA_MEM_BANK_FW;
+		} else if (!strcmp(name, "aie")) {
+			id = AMDXDNA_MEM_BANK_AIE;
 		} else if (!strncmp(name, "aie", 3) &&
 			   !kstrtou32(name + 3, 10, &id)) {
 			id += AMDXDNA_MEM_BANK_AIE;

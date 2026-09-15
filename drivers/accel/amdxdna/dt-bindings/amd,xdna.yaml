@@ -15,13 +15,22 @@ description: |
   a PCI device.
 
   Communication with the remote firmware uses:
-    - Two shared memory regions from reserved-memory:
-        "mgmt"     - management mailbox for command/response messages
-        "doorbell" - doorbell region for hardware context notifications
+    - Four shared memory regions from reserved-memory:
+        "mgmt"     - management command/response ring buffers
+        "doorbell" - lightweight hardware-context notification ring
+        "fw"       - firmware-visible DMA buffer pool (place below 4 GB for
+                     32-bit firmware reachability)
+        "aie"      - AIE/CERT DMA buffer pool for device-side buffers
     - ZynqMP IPI mailbox channels (TX + RX) via the Linux mailbox framework
       for interrupt notification only.  The IPI itself carries no data
-      (bufferless IPI); the actual message payload is written to/read from
-      the shared memory regions.
+      (bufferless IPI); mgmt and doorbell share this same mailbox channel pair
+      for kicks/ack only, while payload/data is written to/read from shared
+      memory.
+
+  The mgmt message protocol is the same XDNA management command protocol used
+  by the PCI transport; only the transport differs (PCI rings+interrupts versus
+  shared-memory+IPI).  The doorbell path remains a minimal dispatch signal and
+  is not an addressable message endpoint.
 
   The ZynqMP IPI mailbox controller (drivers/mailbox/zynqmp-ipi-mailbox.c)
   handles the underlying IPI hardware.  This device node is a mailbox client
@@ -54,30 +63,31 @@ properties:
 
   memory-region:
     minItems: 4
-    maxItems: 10
+    maxItems: 4
     description: |
       Phandles to reserved-memory regions, matched by name via
       memory-region-names.  Required names are "mgmt", "doorbell", "fw", and
-      "aie0".  "mgmt"/"doorbell" are predefined-layout transport regions
+      "aie".  "mgmt"/"doorbell" are predefined-layout transport regions
       accessed only by the CPU (ioremap), not allocator pools.  "fw" and
-      "aie<N>" are reusable shared-dma-pool regions the driver allocates
+      "aie" are reusable shared-dma-pool regions the driver allocates
       cacheable, software-coherent DMA buffers from with dma_alloc (see
-      memory-region-names).  Do not rely on implicit driver fallback banks.
+      memory-region-names).  The mgmt and doorbell rings share the same "tx"/
+      "rx" mailbox channels for notification only.
 
   memory-region-names:
     minItems: 4
-    maxItems: 10
+    maxItems: 4
     uniqueItems: true
     description: |
       Names of the memory-region phandles.  Required: "mgmt", "doorbell".
-      "fw" and "aie0" are also required.  "fw" is firmware-visible and its
+      "fw" and "aie" are also required.  "fw" is firmware-visible and its
       reserved-memory must be placed below 4 GB when firmware reaches only
-      32-bit DMA addresses.  "aie<N>" are AIE/CERT pools and may reside above
-      4 GB if the platform addressing allows it.  All pools are DMA-mapped
-      through this device.  The driver maps these to fixed userspace bank ids
-      used in the create-BO flags: "fw" -> 0, "aie<N>" -> N + 1.
+      32-bit DMA addresses.  "aie" is the device-side AIE/CERT pool and may
+      reside above 4 GB if the platform addressing allows it.  All pools are
+      DMA-mapped through this device.  The driver maps these to fixed userspace
+      bank ids used in the create-BO flags: "fw" -> 0, "aie" -> 1.
     items:
-      enum: [mgmt, doorbell, fw, aie0, aie1, aie2, aie3, aie4, aie5, aie6]
+      enum: [mgmt, doorbell, fw, aie]
     allOf:
       - contains:
           const: mgmt
@@ -86,7 +96,7 @@ properties:
       - contains:
           const: fw
       - contains:
-          const: aie0
+          const: aie
 
 required:
   - compatible
@@ -133,7 +143,7 @@ examples:
             };
 
             /* AIE/CERT DMA pool (cacheable, software-coherent, can be > 4 GB) */
-            aie_cma0: aie-cma@800000000 {
+            aie_cma: aie-cma@800000000 {
                 compatible = "shared-dma-pool";
                 reg = <0x8 0x00000000 0x0 0x40000000>;
                 reusable;
@@ -163,6 +173,6 @@ examples:
         compatible = "amd,xdna-1234", "amd,xdna";
         mboxes = <&ipi_aie 0>, <&ipi_aie 1>;
         mbox-names = "tx", "rx";
-        memory-region = <&mgmt_shmem>, <&doorbell_shmem>, <&rpu_cma>, <&aie_cma0>;
-        memory-region-names = "mgmt", "doorbell", "fw", "aie0";
+        memory-region = <&mgmt_shmem>, <&doorbell_shmem>, <&rpu_cma>, <&aie_cma>;
+        memory-region-names = "mgmt", "doorbell", "fw", "aie";
     };
