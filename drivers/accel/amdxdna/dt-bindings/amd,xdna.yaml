@@ -14,30 +14,24 @@ description: |
   shared-memory and interrupt-notification transport interface when not exposed
   as a PCI function.
 
-  Communication with the remote firmware uses:
-    - Four shared memory regions from reserved-memory:
+  Communication with remote firmware uses:
+    - Four shared-memory regions from reserved-memory:
         "mgmt"     - management command/response ring buffers
-        "doorbell" - lightweight hardware-context notification ring
-        "fw"       - firmware-visible DMA buffer pool (place below 4 GB for
+        "doorbell" - hardware-context notification ring
+        "fw"       - firmware-visible DMA buffer pool (placed below 4 GB for
                      32-bit firmware reachability)
         "aie"      - AIE/CERT DMA buffer pool for device-side buffers
     - ZynqMP/Versal IPI mailbox channels (TX + RX) for interrupt notification
-      only.  The IPI itself carries no data
-      (bufferless IPI); mgmt and doorbell share this same mailbox channel pair
-      for kicks/ack only, while payload/data is written to/read from shared
-      memory.
+      only. The IPI carries no data (bufferless IPI); mgmt and doorbell share
+      this mailbox channel pair for notification only, while data is exchanged
+      through shared memory.
 
   The mgmt message protocol uses the same XDNA command opcodes and response
   semantics as the PCI transport; only the transport differs
-  (PCI rings+interrupts versus shared-memory+IPI).  The doorbell path carries
-  only a 32-bit hardware-context id in the doorbell ring to notify firmware to
-  start/continue execution for that context. On RX IPI interrupt, host
-  completion wait paths are kicked for pending hardware-context queues.
-  Doorbell does not carry command payloads or endpoint addressing.
-
-  The ZynqMP/Versal IPI mailbox controller provides the underlying IPI
-  signaling hardware. This node references that controller's TX and RX
-  channels.
+  (PCI rings/interrupts versus shared-memory/IPI). The doorbell path carries
+  only a 32-bit hardware-context ID to notify firmware to start or continue
+  execution for that context. The doorbell interface carries no command payload
+  and no endpoint addressing.
 
 properties:
   compatible:
