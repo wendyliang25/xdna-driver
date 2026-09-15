@@ -29,8 +29,11 @@ description: |
 
   The mgmt message protocol uses the same XDNA command opcodes and response
   semantics as the PCI transport; only the transport differs
-  (PCI rings+interrupts versus shared-memory+IPI).  The doorbell path remains a
-  minimal dispatch signal and is not an addressable message endpoint.
+  (PCI rings+interrupts versus shared-memory+IPI).  The doorbell path carries
+  only a 32-bit hardware-context id in the doorbell ring to notify firmware to
+  start/continue execution for that context. On RX IPI interrupt, host
+  completion wait paths are kicked for pending hardware-context queues.
+  Doorbell does not carry command payloads or endpoint addressing.
 
   The ZynqMP/Versal IPI mailbox controller provides the underlying IPI
   signaling hardware. This node references that controller's TX and RX
