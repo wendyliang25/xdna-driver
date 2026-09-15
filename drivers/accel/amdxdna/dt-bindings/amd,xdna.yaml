@@ -10,9 +10,9 @@ maintainers:
   - XRT Team <runtimeca39d@amd.com>
 
 description: |
-  The amdxdna platform driver provides a transport layer for the AMD XDNA
-  accelerator on ARM SoC platforms (e.g. ZynqMP / Versal) where the NPU is not
-  a PCI device.
+  AMD XDNA on ARM SoC platforms (for example ZynqMP / Versal) uses a
+  shared-memory and interrupt-notification transport interface when not exposed
+  as a PCI function.
 
   Communication with the remote firmware uses:
     - Four shared memory regions from reserved-memory:
@@ -21,20 +21,20 @@ description: |
         "fw"       - firmware-visible DMA buffer pool (place below 4 GB for
                      32-bit firmware reachability)
         "aie"      - AIE/CERT DMA buffer pool for device-side buffers
-    - ZynqMP IPI mailbox channels (TX + RX) via the Linux mailbox framework
-      for interrupt notification only.  The IPI itself carries no data
+    - ZynqMP/Versal IPI mailbox channels (TX + RX) for interrupt notification
+      only.  The IPI itself carries no data
       (bufferless IPI); mgmt and doorbell share this same mailbox channel pair
       for kicks/ack only, while payload/data is written to/read from shared
       memory.
 
-  The mgmt message protocol is the same XDNA management command protocol used
-  by the PCI transport; only the transport differs (PCI rings+interrupts versus
-  shared-memory+IPI).  The doorbell path remains a minimal dispatch signal and
-  is not an addressable message endpoint.
+  The mgmt message protocol uses the same XDNA command opcodes and response
+  semantics as the PCI transport; only the transport differs
+  (PCI rings+interrupts versus shared-memory+IPI).  The doorbell path remains a
+  minimal dispatch signal and is not an addressable message endpoint.
 
-  The ZynqMP IPI mailbox controller (drivers/mailbox/zynqmp-ipi-mailbox.c)
-  handles the underlying IPI hardware.  This device node is a mailbox client
-  that references the IPI controller's TX and RX channels.
+  The ZynqMP/Versal IPI mailbox controller provides the underlying IPI
+  signaling hardware. This node references that controller's TX and RX
+  channels.
 
 properties:
   compatible:
@@ -43,9 +43,8 @@ properties:
       - const: amd,xdna
     description: |
       The first entry is the specific part, "amd,xdna-<id>", where <id> is the
-      16-bit device id in lower-case hex (e.g. amd,xdna-1234).  The driver is
-      id-agnostic and binds on the generic "amd,xdna"; userspace reads the id
-      from the specific string.
+      16-bit device id in lower-case hex (e.g. amd,xdna-1234).  The second
+      entry, "amd,xdna", identifies the common family interface.
 
   mboxes:
     minItems: 2
@@ -68,11 +67,10 @@ properties:
       Phandles to reserved-memory regions, matched by name via
       memory-region-names.  Required names are "mgmt", "doorbell", "fw", and
       "aie".  "mgmt"/"doorbell" are predefined-layout transport regions
-      accessed only by the CPU (ioremap), not allocator pools.  "fw" and
-      "aie" are reusable shared-dma-pool regions the driver allocates
-      cacheable, software-coherent DMA buffers from with dma_alloc (see
-      memory-region-names).  The mgmt and doorbell rings share the same "tx"/
-      "rx" mailbox channels for notification only.
+      accessed only by the host CPU, not allocator pools.  "fw" and "aie" are
+      reusable shared-dma-pool regions for buffer storage.  The mgmt and
+      doorbell rings share the same "tx"/"rx" mailbox channels for notification
+      only.
 
   memory-region-names:
     minItems: 4
@@ -83,9 +81,7 @@ properties:
       "fw" and "aie" are also required.  "fw" is firmware-visible and its
       reserved-memory must be placed below 4 GB when firmware reaches only
       32-bit DMA addresses.  "aie" is the device-side AIE/CERT pool and may
-      reside above 4 GB if the platform addressing allows it.  All pools are
-      DMA-mapped through this device.  The driver maps these to fixed userspace
-      bank ids used in the create-BO flags: "fw" -> 0, "aie" -> 1.
+      reside above 4 GB if the platform addressing allows it.
     items:
       enum: [mgmt, doorbell, fw, aie]
     allOf:
@@ -113,7 +109,7 @@ examples:
      * Example device tree snippet for ZynqMP / Versal platform.
      *
      * The IPI mailbox controller is the existing xlnx,zynqmp-ipi-mailbox
-     * (or xlnx,versal-ipi-mailbox) driver.  We use bufferless IPI -
+     * (or xlnx,versal-ipi-mailbox) hardware block. We use bufferless IPI -
      * no "msg" reg-names are provided in the IPI child node.
      */
 
@@ -134,7 +130,7 @@ examples:
             };
 
             /* firmware-visible pool, placed < 4 GB for the 32-bit RPU;
-             * cacheable, software-coherent (allocated with dma_alloc).
+             * cacheable, software-coherent.
              * Keep this pool separate from AIE pools. */
             rpu_cma: rpu-cma@70000000 {
                 compatible = "shared-dma-pool";
