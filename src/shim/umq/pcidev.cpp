@@ -31,6 +31,13 @@ is_cache_coherent() const
   return true;
 }
 
+bool
+pdev_umq_nc::
+is_cache_coherent() const
+{
+  return false;
+}
+
 void *
 pdev_umq::
 get_heap_vaddr() const

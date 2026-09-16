@@ -50,6 +50,19 @@ public:
   create_drm_bo(bo_info *arg) const override;
 };
 
+// A UMQ device that is NOT DMA cache-coherent (the aie2ps platform npu12).
+// Identical to pdev_umq except it reports non-coherent, so buffer::sync()
+// performs real cache maintenance (routed through the driver SYNC_BO on the
+// non-coherent platform) instead of skipping it.
+class pdev_umq_nc : public pdev_umq
+{
+public:
+  using pdev_umq::pdev_umq;
+
+  bool
+  is_cache_coherent() const override;
+};
+
 }
 
 #endif
