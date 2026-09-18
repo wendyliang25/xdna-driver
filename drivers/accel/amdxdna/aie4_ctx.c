@@ -9,6 +9,7 @@
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_print.h>
 #include <drm/gpu_scheduler.h>
+#include <linux/dma-map-ops.h>
 #include <linux/minmax.h>
 #include <linux/overflow.h>
 #include <linux/sched/mm.h>
@@ -29,6 +30,12 @@
 
 #define CTX_INVALID_ID			(~0U)
 #define CTX_INVALID_DOORBELL		AMDXDNA_INVALID_DOORBELL_OFFSET
+
+/* The aie4 PCI part is cache-coherent; the platform part is not. */
+static inline bool aie4_dev_coherent(struct amdxdna_dev *xdna)
+{
+	return dev_is_dma_coherent(xdna->ddev.dev);
+}
 
 static void job_worker(struct work_struct *work);
 
@@ -535,6 +542,21 @@ void aie4_fill_health_data(struct amdxdna_gem_obj *cmd_abo, struct amdxdna_hwctx
 	mutex_unlock(&priv->io_lock);
 }
 
+/*
+ * Cache-sync [offset, offset+size) of a BO through the DMA API. Used for the
+ * shared host queue and command BOs. A no-op on a cache-coherent transport.
+ */
+static inline int aie4_sync_bo_range(struct amdxdna_gem_obj *abo, u64 offset,
+				     size_t size, enum dma_data_direction dir)
+{
+	struct amdxdna_dev *xdna = to_xdna_dev(to_gobj(abo)->dev);
+
+	if (aie4_dev_coherent(xdna))
+		return 0;
+
+	return amdxdna_gem_dma_sync_range(abo, offset, size, dir);
+}
+
 static void aie4_hwctx_umq_fini(struct amdxdna_hwctx *hwctx)
 {
 	if (hwctx->priv && hwctx->priv->umq_bo)
@@ -633,6 +655,16 @@ static int aie4_hwctx_umq_init(struct amdxdna_hwctx *hwctx)
 		priv->umq_indirect_pkts[i].header.count = sizeof(struct exec_buf);
 		priv->umq_indirect_pkts[i].header.distribute = 1;
 	}
+
+	/*
+	 * Publish the initialised queue so the non-coherent CERT reads it, not
+	 * stale DRAM.
+	 */
+	ret = aie4_sync_bo_range(umq_bo, 0,
+				 sizeof(*qhdr) + pkts_sz + indir_pkts_sz,
+				 DMA_TO_DEVICE);
+	if (ret)
+		goto err_fini;
 
 	return 0;
 
@@ -771,6 +803,9 @@ static u64 get_read_index(struct amdxdna_hwctx *hwctx)
 	 * command early and corrupts or hangs itself - it cannot reach another
 	 * context.
 	 */
+	/* Drop stale cache lines so the sample sees CERT's DRAM write_index. */
+	aie4_sync_bo_range(priv->umq_bo, 0, sizeof(*priv->umq_read_index),
+			   DMA_FROM_DEVICE);
 	ri = READ_ONCE(*priv->umq_read_index);
 	/* Order the read_index sample before the write_index sample. */
 	smp_rmb();
@@ -785,6 +820,8 @@ static u64 get_read_index(struct amdxdna_hwctx *hwctx)
 	 * waiter re-checks on the next completion wake or timeout.
 	 */
 	if (!valid_queue_index(ri, wi, CTX_MAX_CMDS)) {
+		aie4_sync_bo_range(priv->umq_bo, 0,
+				   sizeof(*priv->umq_read_index), DMA_FROM_DEVICE);
 		ri = READ_ONCE(*priv->umq_read_index);
 		/* Order the read_index sample before the write_index sample. */
 		smp_rmb();
@@ -879,6 +916,10 @@ static u64 publish_cmd(struct amdxdna_hwctx *hwctx)
 	/* Order the packet-slot writes before CERT sees the new write_index. */
 	wmb();
 	WRITE_ONCE(*priv->umq_write_index, wi + 1);
+	/* Clean write_index to DRAM for a non-coherent CERT. */
+	aie4_sync_bo_range(priv->umq_bo,
+			   offsetof(struct host_queue_header, write_index),
+			   sizeof(*priv->umq_write_index), DMA_TO_DEVICE);
 	return wi;
 }
 
@@ -1015,6 +1056,10 @@ static int fill_indirect_pkt(struct amdxdna_hwctx_priv *priv, u64 slot_idx,
 			lower_32_bits(dpu->dtrace_buffer);
 		hipd->payload.dtrace_buf_host_addr_high =
 			lower_16_bits(upper_32_bits(dpu->dtrace_buffer));
+		/* Clean the scattered indirect packet for a non-coherent CERT. */
+		aie4_sync_bo_range(priv->umq_bo,
+				   (const u8 *)hipd - (const u8 *)priv->umq_read_index,
+				   sizeof(*hipd), DMA_TO_DEVICE);
 	}
 	pkt->pkt_header.common_header.distribute = 1;
 	pkt->pkt_header.common_header.indirect = 1;
@@ -1114,6 +1159,24 @@ static int submit_one_cmd(struct amdxdna_hwctx *hwctx,
 	pkt->pkt_header.common_header.reserved = 0x0;
 	pkt->pkt_header.completion_signal = amdxdna_gem_dev_addr(cmd_abo) +
 					    offsetof(struct amdxdna_cmd, header);
+	/* Clean the packet slot (direct ebuf or indirect entries) before the doorbell. */
+	aie4_sync_bo_range(priv->umq_bo,
+			   (const u8 *)pkt - (const u8 *)priv->umq_read_index,
+			   sizeof(*pkt), DMA_TO_DEVICE);
+	/*
+	 * On a non-coherent device CERT reports completion by DMA-writing the
+	 * command state to cmd_abo (completion_signal, above).  User space filled
+	 * the command through a cacheable mapping, leaving the state header line
+	 * dirty; a later CPU write-back would land on top of CERT's result and the
+	 * shim would read a stale NEW state.  Clean the cmd BO to DRAM now (before
+	 * the doorbell) so the line is clean and eviction cannot clobber CERT.
+	 * No-op on the coherent PCI part.
+	 */
+	ret = aie4_sync_bo_range(cmd_abo, 0, cmd_abo->mem.size, DMA_TO_DEVICE);
+	if (ret) {
+		XDNA_ERR(xdna, "Sync cmd BO failed, ret %d", ret);
+		return ret;
+	}
 	ri = get_read_index(hwctx);
 	*seq = publish_cmd(hwctx);
 	aie4_doorbell_ring(hwctx);
@@ -1189,6 +1252,9 @@ static void update_read_index(struct amdxdna_hwctx *hwctx, u64 idx)
 	/* Order cmd-bo state write before the waiter observes completion. */
 	wmb();
 	WRITE_ONCE(*priv->umq_read_index, idx);
+	/* Clean read_index so a waiter (and CERT after recreate) sees it in DRAM. */
+	aie4_sync_bo_range(priv->umq_bo, 0, sizeof(*priv->umq_read_index),
+			   DMA_TO_DEVICE);
 }
 
 static void job_abort(struct amdxdna_sched_job *job)
@@ -1197,6 +1263,13 @@ static void job_abort(struct amdxdna_sched_job *job)
 
 	XDNA_WARN(hwctx->client->xdna, "aborting %s job %lld", hwctx->name, job->seq);
 	amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_ABORT);
+	/*
+	 * The state just written is dirty in the CPU cache. On a non-coherent
+	 * device the shim invalidates cmd_bo (SYNC_BO device-to-host) when it sees
+	 * the completion, which would discard this driver-written state and leave
+	 * user space reading a stale NEW. Clean it to DRAM before publishing.
+	 */
+	aie4_sync_bo_range(job->cmd_bo, 0, job->cmd_bo->mem.size, DMA_TO_DEVICE);
 	/*
 	 * Only force read_index forward when CERT has not already moved it past this
 	 * job. On the reset drain read_index is still <= job->seq (CERT stopped), so
@@ -1245,10 +1318,18 @@ static void aie4_fill_chain_health_data(struct amdxdna_hwctx *hwctx,
 		aie4_fill_health_data_locked(sub_abo, hwctx);
 	mutex_unlock(&priv->io_lock);
 
-	if (sub_abo)
+	if (sub_abo) {
+		/*
+		 * The health report was written into sub_abo through the CPU's cached
+		 * mapping. The shim invalidates each sub-command BO on completion, so
+		 * clean it to DRAM now or the report is discarded. (The error_index
+		 * written into the parent cmd_bo above is cleaned by the caller.)
+		 */
+		aie4_sync_bo_range(sub_abo, 0, sub_abo->mem.size, DMA_TO_DEVICE);
 		amdxdna_gem_put_obj(sub_abo);
-	else
+	} else {
 		XDNA_ERR(xdna, "Failed to find sub cmd BO %u", (u32)payload->data[i]);
+	}
 }
 
 /*
@@ -1270,6 +1351,14 @@ static void job_timeout(struct amdxdna_sched_job *job)
 		aie4_fill_health_data(job->cmd_bo, hwctx);
 
 	amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_TIMEOUT);
+	/*
+	 * Clean the driver-written state -- and, for a non-chain command, the health
+	 * report filled into cmd_bo above -- to DRAM before publishing. The shim
+	 * invalidates cmd_bo on completion, which would otherwise discard these CPU
+	 * writes and surface a stale NEW state with no health data. (A chain's health
+	 * lands in a sub-command BO, cleaned in aie4_fill_chain_health_data().)
+	 */
+	aie4_sync_bo_range(job->cmd_bo, 0, job->cmd_bo->mem.size, DMA_TO_DEVICE);
 	update_read_index(hwctx, job->seq + 1);
 	job_done(job);
 }
