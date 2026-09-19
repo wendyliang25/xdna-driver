@@ -3,32 +3,99 @@
  * Copyright (C) 2026, Advanced Micro Devices, Inc.
  */
 
-#include <linux/dma-buf.h>
+#include "drm/amdxdna_accel.h"
+#include <drm/drm_device.h>
+#include <drm/drm_gem.h>
+#include <drm/drm_vma_manager.h>
 #include <linux/dma-mapping.h>
 #include <linux/iosys-map.h>
-#include <linux/kernel.h>
+#include <linux/log2.h>
+#include <linux/mm.h>
+#include <linux/scatterlist.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 
 #include "amdxdna_cma_buf.h"
 #include "amdxdna_drv.h"
+#include "amdxdna_gem.h"
 
 /*
- * CMA backend. On platforms without IOMMU/SVA (e.g. arm64), the device cannot
- * use shared virtual addressing and there may be no carveout configured. In
- * that case BOs are backed by physically contiguous, DMA-coherent memory
- * allocated from the system CMA pool and exported as a dma-buf.
+ * CMA create-BO backing.  Physically contiguous, cacheable pages from the
+ * device's DMA pool: the DT-reserved "aie"/fw region when a reusable
+ * shared-dma-pool memory-region is bound to the device (dev->cma_area),
+ * otherwise the system CMA.  dma_alloc_pages() returns cacheable pages (fast
+ * for command-BO writes); coherency with a non-coherent CERT is done by
+ * SYNC_BO, which is a no-op on a cache-coherent device, so this backing is
+ * correct on the coherent npu3a part too.
+ *
+ * The BO is a native DRM GEM object -- there is no raw dma_buf_export() here.
+ * Userspace obtains a dma-buf through the standard PRIME path
+ * (DRM_IOCTL_PRIME_HANDLE_TO_FD -> fallback to drm_gem_prime_export).
  */
-struct amdxdna_cmabuf_priv {
-	struct device	*dev;
-	dma_addr_t	dma_addr;
-	void		*cpu_addr;
-	size_t		size;
-};
 
-static struct sg_table *
-amdxdna_cmabuf_map(struct dma_buf_attachment *attach,
-		   enum dma_data_direction dir)
+static void amdxdna_gem_cma_obj_free(struct drm_gem_object *gobj)
 {
-	struct amdxdna_cmabuf_priv *cbuf = attach->dmabuf->priv;
+	struct amdxdna_dev *xdna = to_xdna_dev(gobj->dev);
+	struct amdxdna_gem_obj *abo = to_xdna_obj(gobj);
+	struct device *dev = xdna->ddev.dev;
+
+	/* Drop the device mapping (iova, or the streaming sgt) taken while in use. */
+	amdxdna_dma_unmap_bo(xdna, abo);
+	if (abo->mem.sgt) {
+		dma_unmap_sgtable(dev, abo->mem.sgt, DMA_BIDIRECTIONAL, 0);
+		sg_free_table(abo->mem.sgt);
+		kfree(abo->mem.sgt);
+	}
+
+	dma_free_pages(dev, abo->mem.size, abo->mem.pages[0], abo->cma_dma_addr,
+		       DMA_BIDIRECTIONAL);
+	kvfree(abo->mem.pages);
+	drm_gem_object_release(gobj);
+	amdxdna_gem_destroy_obj(abo);
+}
+
+static int amdxdna_gem_cma_obj_vmap(struct drm_gem_object *gobj, struct iosys_map *map)
+{
+	struct amdxdna_gem_obj *abo = to_xdna_obj(gobj);
+
+	/* Contiguous lowmem pages: the linear kernel mapping is the vaddr. */
+	iosys_map_set_vaddr(map, page_address(abo->mem.pages[0]));
+	return 0;
+}
+
+static void amdxdna_gem_cma_obj_vunmap(struct drm_gem_object *gobj, struct iosys_map *map)
+{
+	/* page_to_virt() is not a separate mapping; nothing to tear down. */
+	iosys_map_clear(map);
+}
+
+static int amdxdna_gem_cma_obj_mmap(struct drm_gem_object *gobj, struct vm_area_struct *vma)
+{
+	struct amdxdna_dev *xdna = to_xdna_dev(gobj->dev);
+	struct amdxdna_gem_obj *abo = to_xdna_obj(gobj);
+
+	/*
+	 * drm_gem_mmap() encodes a fake buffer offset in vm_pgoff and sets
+	 * VM_PFNMAP; the CMA backing is real struct pages, so map the whole
+	 * buffer from offset 0 with the DMA API page helper (cacheable prot).
+	 */
+	vma->vm_pgoff -= drm_vma_node_start(&gobj->vma_node);
+	vm_flags_mod(vma, VM_DONTEXPAND, VM_PFNMAP);
+	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+
+	return dma_mmap_pages(xdna->ddev.dev, vma, vma->vm_end - vma->vm_start,
+			      abo->mem.pages[0]);
+}
+
+/*
+ * Unmapped sg_table describing the backing pages, for the standard GEM PRIME
+ * export path (drm_gem_map_dma_buf() then maps it for the importer).  Distinct
+ * from amdxdna_gem_get_sgt(), which returns the device-mapped, cached sgt used
+ * internally; the table returned here is freed by drm_gem_unmap_dma_buf().
+ */
+static struct sg_table *amdxdna_gem_cma_get_sg_table(struct drm_gem_object *gobj)
+{
+	struct amdxdna_gem_obj *abo = to_xdna_obj(gobj);
 	struct sg_table *sgt;
 	int ret;
 
@@ -36,123 +103,110 @@ amdxdna_cmabuf_map(struct dma_buf_attachment *attach,
 	if (!sgt)
 		return ERR_PTR(-ENOMEM);
 
-	ret = dma_get_sgtable(cbuf->dev, sgt, cbuf->cpu_addr, cbuf->dma_addr,
-			      cbuf->size);
-	if (ret)
-		goto free_sgt;
-
-	ret = dma_map_sgtable(attach->dev, sgt, dir, 0);
-	if (ret)
-		goto free_table;
+	ret = sg_alloc_table_from_pages(sgt, abo->mem.pages, abo->mem.nr_pages,
+					0, abo->mem.size, GFP_KERNEL);
+	if (ret) {
+		kfree(sgt);
+		return ERR_PTR(ret);
+	}
 
 	return sgt;
-
-free_table:
-	sg_free_table(sgt);
-free_sgt:
-	kfree(sgt);
-	return ERR_PTR(ret);
 }
 
-static void amdxdna_cmabuf_unmap(struct dma_buf_attachment *attach,
-				 struct sg_table *sgt,
-				 enum dma_data_direction dir)
-{
-	dma_unmap_sgtable(attach->dev, sgt, dir, 0);
-	sg_free_table(sgt);
-	kfree(sgt);
-}
-
-static void amdxdna_cmabuf_release(struct dma_buf *dbuf)
-{
-	struct amdxdna_cmabuf_priv *cmabuf = dbuf->priv;
-
-	if (!cmabuf)
-		return;
-
-	dma_free_coherent(cmabuf->dev, cmabuf->size, cmabuf->cpu_addr,
-			  cmabuf->dma_addr);
-	kfree(cmabuf);
-	dbuf->priv = NULL;
-}
-
-static int amdxdna_cmabuf_mmap(struct dma_buf *dbuf, struct vm_area_struct *vma)
-{
-	struct amdxdna_cmabuf_priv *cmabuf = dbuf->priv;
-	size_t size = vma->vm_end - vma->vm_start;
-
-	if (vma->vm_pgoff)
-		return -EINVAL;
-	if (size > cmabuf->size)
-		return -EINVAL;
-
-	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
-
-	return dma_mmap_coherent(cmabuf->dev, vma, cmabuf->cpu_addr,
-				 cmabuf->dma_addr, size);
-}
-
-static int amdxdna_cmabuf_vmap(struct dma_buf *dbuf, struct iosys_map *map)
-{
-	struct amdxdna_cmabuf_priv *cmabuf = dbuf->priv;
-
-	iosys_map_set_vaddr(map, cmabuf->cpu_addr);
-
-	return 0;
-}
-
-static const struct dma_buf_ops amdxdna_cmabuf_dmabuf_ops = {
-	.map_dma_buf	= amdxdna_cmabuf_map,
-	.unmap_dma_buf	= amdxdna_cmabuf_unmap,
-	.release	= amdxdna_cmabuf_release,
-	.mmap		= amdxdna_cmabuf_mmap,
-	.vmap		= amdxdna_cmabuf_vmap,
+static const struct vm_operations_struct amdxdna_gem_cma_vm_ops = {
+	.open = drm_gem_vm_open,
+	.close = drm_gem_vm_close,
 };
 
-struct dma_buf *amdxdna_get_cma_buf(struct drm_device *dev, size_t size)
+static const struct drm_gem_object_funcs amdxdna_gem_cma_obj_funcs = {
+	.free = amdxdna_gem_cma_obj_free,
+	.open = amdxdna_gem_obj_open,
+	.close = amdxdna_gem_obj_close,
+	.vmap = amdxdna_gem_cma_obj_vmap,
+	.vunmap = amdxdna_gem_cma_obj_vunmap,
+	.mmap = amdxdna_gem_cma_obj_mmap,
+	.vm_ops = &amdxdna_gem_cma_vm_ops,
+	.get_sg_table = amdxdna_gem_cma_get_sg_table,
+};
+
+struct amdxdna_gem_obj *
+amdxdna_get_cma_buf(struct drm_device *dev, struct amdxdna_drm_create_bo *args)
 {
 	struct amdxdna_dev *xdna = to_xdna_dev(dev);
-	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
-	struct amdxdna_cmabuf_priv *cmabuf;
-	struct device *ddev = dev->dev;
-	struct dma_buf *dbuf;
+	struct device *cma_dev = xdna->ddev.dev;
+	size_t size = PAGE_ALIGN(args->size);
+	struct amdxdna_gem_obj *abo;
+	unsigned long i, npages;
 	dma_addr_t dma_addr;
-	void *cpu_addr;
+	struct page *page;
+	u64 align;
 	int ret;
 
-	cmabuf = kzalloc_obj(*cmabuf);
-	if (!cmabuf)
+	if (!size) {
+		XDNA_ERR(xdna, "Invalid BO size 0x%llx", args->size);
+		return ERR_PTR(-EINVAL);
+	}
+
+	/*
+	 * A dev-heap BO must be self-aligned to its size.  dma_alloc_pages()
+	 * aligns to get_order(size) (capped by CONFIG_CMA_ALIGNMENT), so grow
+	 * the request until natural alignment satisfies @align; alignments
+	 * beyond CONFIG_CMA_ALIGNMENT need that Kconfig raised.
+	 */
+	align = (args->type == AMDXDNA_BO_DEV_HEAP) ? xdna->dev_info->dev_mem_size : 0;
+	if (align > size)
+		size = roundup_pow_of_two(align);
+
+	page = dma_alloc_pages(cma_dev, size, &dma_addr, DMA_BIDIRECTIONAL, GFP_KERNEL);
+	if (!page) {
+		XDNA_DBG(xdna, "CMA alloc failed on %s: size 0x%zx",
+			 dev_name(cma_dev), size);
 		return ERR_PTR(-ENOMEM);
+	}
+	/* dma_alloc_pages() does not zero; clear before exposing to userspace. */
+	memset(page_address(page), 0, size);
 
-	size = PAGE_ALIGN(size);
-	cpu_addr = dma_alloc_coherent(ddev, size, &dma_addr, GFP_KERNEL);
-	if (!cpu_addr) {
-		XDNA_ERR(xdna, "Failed to alloc 0x%zx CMA bytes", size);
+	abo = amdxdna_gem_create_obj(dev, size);
+	if (IS_ERR(abo)) {
+		ret = PTR_ERR(abo);
+		goto free_pages;
+	}
+
+	npages = size >> PAGE_SHIFT;
+	abo->mem.pages = kvmalloc_objs(*abo->mem.pages, npages);
+	if (!abo->mem.pages) {
 		ret = -ENOMEM;
-		goto free_cmabuf;
+		goto destroy_obj;
+	}
+	for (i = 0; i < npages; i++)
+		abo->mem.pages[i] = pfn_to_page(page_to_pfn(page) + i);
+	abo->mem.nr_pages = npages;
+	abo->cma_dma_addr = dma_addr;
+	abo->private_buffer = true;
+	abo->type = AMDXDNA_BO_SHARE;
+
+	to_gobj(abo)->funcs = &amdxdna_gem_cma_obj_funcs;
+	drm_gem_private_object_init(dev, to_gobj(abo), size);
+
+	/*
+	 * A private GEM object gets no fake mmap offset for free, so create one
+	 * here; GET_BO_INFO returns it and userspace mmap()s the BO handle at
+	 * that offset (drm_gem_mmap() -> amdxdna_gem_cma_obj_mmap()).
+	 */
+	ret = drm_gem_create_mmap_offset(to_gobj(abo));
+	if (ret) {
+		XDNA_ERR(xdna, "Create mmap offset failed, ret %d", ret);
+		drm_gem_object_release(to_gobj(abo));
+		goto free_bo_pages;
 	}
 
-	cmabuf->dev = ddev;
-	cmabuf->cpu_addr = cpu_addr;
-	cmabuf->dma_addr = dma_addr;
-	cmabuf->size = size;
+	return abo;
 
-	exp_info.size = size;
-	exp_info.ops = &amdxdna_cmabuf_dmabuf_ops;
-	exp_info.priv = cmabuf;
-	exp_info.flags = O_RDWR;
-
-	dbuf = dma_buf_export(&exp_info);
-	if (IS_ERR(dbuf)) {
-		ret = PTR_ERR(dbuf);
-		goto free_dma;
-	}
-
-	return dbuf;
-
-free_dma:
-	dma_free_coherent(ddev, size, cpu_addr, dma_addr);
-free_cmabuf:
-	kfree(cmabuf);
+free_bo_pages:
+	kvfree(abo->mem.pages);
+destroy_obj:
+	amdxdna_gem_destroy_obj(abo);
+free_pages:
+	dma_free_pages(cma_dev, size, page, dma_addr, DMA_BIDIRECTIONAL);
 	return ERR_PTR(ret);
 }
