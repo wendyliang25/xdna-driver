@@ -63,6 +63,41 @@ elif [ -e "/boot/config-$KERNEL_VER" ]; then
     fi
 fi
 
+# ---- Work around a kernel-headers quoting bug --------------------------
+# The external-module "prepare" rule compares $(CC_VERSION_TEXT) against
+# $(CONFIG_CC_VERSION_TEXT). The latter is read from auto.conf with its
+# literal double-quotes, and the recipe re-wraps it in quotes, producing
+# e.g. ""gcc (Ubuntu 15.2.0) 15.2.0"". When the compiler version string
+# contains parentheses, /bin/sh (dash) hits a bare "(" and aborts the
+# whole module build with: Syntax error: "(" unexpected.
+# Overriding both to empty on the command line makes the check a no-op
+# (if [ "" != "" ]) with no parentheses to trip over.
+VERS_FIX="CC_VERSION_TEXT= CONFIG_CC_VERSION_TEXT="
+
+# ---- Work around a missing in-tree objtool -----------------------------
+# Some kernel-headers packages ship tools/objtool/ with only a Makefile and
+# no prebuilt binary (and no source), so CONFIG_OBJTOOL=y builds die with:
+#   /usr/src/.../tools/objtool/objtool: not found  (Error 127)
+# objtool is a host tool; a binary from a near-matching kernel works fine.
+# If ours is missing/non-executable, borrow one from a sibling kernel tree
+# and pass it via the (command-line-overridable) lowercase `objtool` var.
+OBJTOOL_FIX=""
+_intree_objtool="${KERNEL_SRC}/tools/objtool/objtool"
+if [ ! -x "$_intree_objtool" ]; then
+    for _cand in /usr/src/kernels/*/tools/objtool/objtool \
+                 /usr/src/linux-headers-*/tools/objtool/objtool; do
+        [ -x "$_cand" ] || continue
+        # rc 127 == exec failed (missing interpreter/libs); anything else means
+        # the binary actually ran (objtool exits 129 on --help, which is fine).
+        _rc=0; "$_cand" --help >/dev/null 2>&1 || _rc=$?
+        if [ "$_rc" -ne 127 ]; then
+            OBJTOOL_FIX="objtool=$_cand"
+            echo ">>> in-tree objtool missing; using $_cand" >&2
+            break
+        fi
+    done
+fi
+
 echo ">>> Probing kernel features in $KERNEL_SRC..." >&2
 echo ">>> Output file: $(pwd)/${OUT}" >&2
 
@@ -100,7 +135,7 @@ EOF
     cat >> "$conftest_c"
 
     # Now build it like your real driver ($USE_LLVM intentionally unquoted to avoid empty arg)
-    if make -s -C "$KERNEL_SRC" M="$tmpdir" modules $USE_LLVM >/dev/null 2>&1; then
+    if make -s -C "$KERNEL_SRC" M="$tmpdir" modules $VERS_FIX $OBJTOOL_FIX $USE_LLVM >/dev/null 2>&1; then
         echo "#define $macro 1" >> "$OUT"
         echo ">>>  + $macro: yes" >&2
     else
@@ -126,7 +161,7 @@ static void __exit conftest_exit(void) {}
 module_init(conftest_init);
 module_exit(conftest_exit);
 EOF
-if ! _canary_err=$(make -s -C "$KERNEL_SRC" M="$_canary_dir" modules $USE_LLVM 2>&1); then
+if ! _canary_err=$(make -s -C "$KERNEL_SRC" M="$_canary_dir" modules $VERS_FIX $OBJTOOL_FIX $USE_LLVM 2>&1); then
     echo "ERROR: Kernel module build sanity check failed." >&2
     echo "ERROR: Build output:" >&2
     echo "$_canary_err" | sed 's/^/  /' >&2
@@ -137,7 +172,7 @@ if ! _canary_err=$(make -s -C "$KERNEL_SRC" M="$_canary_dir" modules $USE_LLVM 2
     echo "     sudo ln -s /usr/lib/x86_64-linux-gnu/libopcodes-<ver>-system.so \\" >&2
     echo "                /usr/lib/x86_64-linux-gnu/libopcodes-<required-ver>-system.so" >&2
     echo "  2. Check kernel headers exist: ls $KERNEL_SRC/include/linux/module.h" >&2
-    echo "  3. Reproduce manually: make -C $KERNEL_SRC M=$_canary_dir modules $USE_LLVM" >&2
+    echo "  3. Reproduce manually: make -C $KERNEL_SRC M=$_canary_dir modules $VERS_FIX $OBJTOOL_FIX $USE_LLVM" >&2
     rm -rf "$_canary_dir"
     exit 1
 fi
