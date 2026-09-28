@@ -2,6 +2,7 @@
 // Copyright (C) 2022-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "pcidev.h"
+#include "../buffer.h"
 #include "../shim_debug.h"
 #include <algorithm>
 #include <cctype>
@@ -11,24 +12,12 @@
 namespace shim_xdna {
 
 void
-pdev_umq::
-on_first_open() const
+pdev_umq_nc::
+sync_bo(buffer& bo, xrt_core::buffer_handle::direction dir,
+        size_t size, size_t offset) const
 {
-  // do nothing
-}
-
-void
-pdev_umq::
-on_last_close() const
-{
-  // do nothing
-}
-
-bool
-pdev_umq::
-is_cache_coherent() const
-{
-  return true;
+  // Non-coherent: do the arch-appropriate cache maintenance.
+  cache_sync(bo, dir, size, offset);
 }
 
 void *

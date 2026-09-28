@@ -36,6 +36,13 @@ inline bool valid_queue_index(uint64_t read, uint64_t write, uint32_t capacity)
 
 namespace shim_xdna {
 
+// A cmd BO is read-back invalidated (device2host) before the CPU reads the
+// completion state the device/CERT wrote. Some of these BOs are held const
+// (only their state is read); buffer_handle::sync() is non-const because it also
+// covers the mutating host2device direction, so those sites cast away const to
+// invalidate -- a device2host read-back does not change the BO's logical value.
+static constexpr auto dev2host = xrt_core::buffer_handle::direction::device2host;
+
 hwq_umq::
 hwq_umq(const device& dev, size_t nslots) : hwq(dev)
 {
@@ -389,6 +396,8 @@ hwq_umq::
 complete_command(xrt_core::buffer_handle *cmd) const
 {
   auto boh = static_cast<cmd_buffer*>(cmd);
+
+  boh->sync(dev2host, boh->size(), 0);
   auto cmdpkt = reinterpret_cast<ert_packet *>(boh->vaddr());
 
   // Single cmd completion, cmd state maybe updated by CERT (normal case), or by
@@ -436,6 +445,8 @@ complete_command(xrt_core::buffer_handle *cmd) const
   auto payload = get_ert_cmd_chain_data(cmdpkt);
   auto last_cmd_bo = static_cast<const cmd_buffer *>(
     m_pdev.find_bo_by_handle(payload->data[payload->command_count - 1]));
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+  const_cast<cmd_buffer *>(last_cmd_bo)->sync(dev2host, last_cmd_bo->size(), 0);
   auto last_cmdpkt = reinterpret_cast<ert_packet *>(last_cmd_bo->vaddr());
   // Most common case, cmd is completed successfully.
   if (last_cmdpkt->state == ERT_CMD_STATE_COMPLETED) {
@@ -447,6 +458,11 @@ complete_command(xrt_core::buffer_handle *cmd) const
   for (size_t i = payload->command_count; i > 0; i--) {
     auto idx = i - 1;
     auto subcmd = static_cast<const cmd_buffer *>(m_pdev.find_bo_by_handle(payload->data[idx]));
+    // The last sub-cmd was already invalidated by the fast-path check above.
+    if (idx != payload->command_count - 1) {
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-const-cast)
+      const_cast<cmd_buffer *>(subcmd)->sync(dev2host, subcmd->size(), 0);
+    }
     auto subcmd_pkt = reinterpret_cast<ert_packet *>(subcmd->vaddr());
     auto st = subcmd_pkt->state;
     if (st != ERT_CMD_STATE_ABORT) {
@@ -460,12 +476,6 @@ complete_command(xrt_core::buffer_handle *cmd) const
     // CERT failed to set error state properly.
     if (is_kernel_mode_submission()) {
       // In KMS, it is not expected.
-      for (size_t j = 0; j < payload->command_count; j++) {
-        auto sc = static_cast<const cmd_buffer *>(
-          m_pdev.find_bo_by_handle(payload->data[j]));
-        auto pkt = reinterpret_cast<ert_packet *>(sc->vaddr());
-	shim_debug("sub-cmd[%zu] state=%d", j, static_cast<unsigned int>(pkt->state));
-      }
       shim_err(EINVAL, "Chained cmd completed with unexpected state in subcmds");
     } else {
       // In UMS, CERT may just timed out. Mark it as abort since no ctx health data.
@@ -518,6 +528,11 @@ poll_command(xrt_core::buffer_handle *cmd) const
 
   auto boh = static_cast<cmd_buffer*>(cmd);
   auto seq = boh->wait_for_submitted();
+  // CERT DMA-writes read_index into the queue BO to signal completion; on a
+  // non-coherent device the CPU's cached copy is stale, so invalidate it before
+  // reading. read_index is the first header field.
+  m_umq_bo->sync(dev2host, sizeof(m_umq_hdr->read_index),
+    offsetof(struct host_queue_header, read_index));
   if (m_umq_hdr->read_index <= seq)
     return 0;
 
