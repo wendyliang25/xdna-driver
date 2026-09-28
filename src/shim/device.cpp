@@ -210,6 +210,40 @@ platform_device_id(const std::shared_ptr<xrt_core::pci::dev>& pdev)
     std::strtoul(compat.c_str() + pos + prefix.size(), nullptr, 16));
 }
 
+// The of_plat npu12 part also carries a human-readable silicon part number in
+// its device-tree compatible list (for example "xc2ve3858" for T50).  The list
+// is NUL-separated; each entry may be bare ("xc2ve3858") or vendor-prefixed
+// ("amd,xc2ve3858" / "xlnx,xc2ve3858").  Return the part-number token (the one
+// whose value, after any "vendor," prefix, begins with "xc"), or empty if none
+// is present (e.g. a PCI part, whose compatible only carries "amd,xdna-<hex>").
+static std::string
+platform_device_id_str(const std::shared_ptr<xrt_core::pci::dev>& pdev)
+{
+  std::string compat;
+  try {
+    compat = sysfs_fcn<std::string>::get(pdev, "", "of_node/compatible");
+  }
+  catch (const xrt_core::query::sysfs_error&) {
+    return {};
+  }
+
+  size_t start = 0;
+  while (start < compat.size()) {
+    auto end = compat.find('\0', start);
+    if (end == std::string::npos)
+      end = compat.size();
+    std::string token = compat.substr(start, end - start);
+    start = end + 1;
+
+    auto comma = token.find(',');
+    const std::string value = (comma == std::string::npos) ? token : token.substr(comma + 1);
+    if (value.rfind("xc", 0) == 0)
+      return value;
+  }
+
+  return {};
+}
+
 // Device-aware is_aie4: a PCI part is matched by its device id; a platform
 // (non-PCI) part has no "device" sysfs node, so identify it by its device-tree
 // compatible instead.  Every amdxdna part on the platform bus is an aie4 part.
@@ -880,6 +914,20 @@ struct pcie_device
   get(const xrt_core::device* device, key_type key)
   {
     return pcie_id::get(device, key).device_id;
+  }
+};
+
+// query::device_id_str is the human-readable part number sourced from the
+// device-tree compatible.  Empty for parts that don't carry one (PCI parts),
+// letting XRT fall back to the numeric device id.
+struct device_id_str
+{
+  using result_type = query::device_id_str::result_type;
+
+  static result_type
+  get(const xrt_core::device* device, key_type)
+  {
+    return platform_device_id_str(get_pcidev(device));
   }
 };
 
@@ -2557,6 +2605,7 @@ initialize_query_table()
   emplace_func0_request<query::pcie_bdf,                       bdf>();
   emplace_func0_request<query::pcie_id,                        pcie_id>();
   emplace_func0_request<query::pcie_device,                    pcie_device>();
+  emplace_func0_request<query::device_id_str,                  device_id_str>();
   emplace_func0_request<query::total_cols,                     total_cols>();
   emplace_sysfs_get<query::pcie_express_lane_width>            ("", "link_width");
   emplace_sysfs_get<query::pcie_express_lane_width_max>        ("", "link_width_max");
