@@ -260,11 +260,23 @@ find_bo_by_handle(uint64_t handle) const
 #if defined(__x86_64__) || defined(_M_X64)
 namespace {
 
-const long cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+// sysconf() can report the L1 line size as -1 (error) or 0 (indeterminate);
+// fall back to 64 (every x86-64 part) so the flush loop always makes progress.
+long
+resolve_cacheline_size()
+{
+  long sz = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+  return sz > 0 ? sz : 64;
+}
+
+const long cacheline_size = resolve_cacheline_size();
 
 void
 clflush_data(const void *base, size_t offset, size_t len)
 {
+  if (!len)
+    return;
+
   const char *cur = static_cast<const char *>(base) + offset;
   uintptr_t lastline = (uintptr_t)(cur + len - 1) | (cacheline_size - 1);
   // x86 CLFLUSH is not ordered vs younger loads; fence so the flush is globally
