@@ -129,6 +129,121 @@ static const struct drm_gem_object_funcs amdxdna_gem_cma_obj_funcs = {
 	.get_sg_table = amdxdna_gem_cma_get_sg_table,
 };
 
+/*
+ * Debug backing (debugfs "cma_coherent"): non-cacheable coherent memory from
+ * dma_alloc_coherent(), addressed directly by its dma_addr and needing no cache
+ * maintenance (amdxdna_gem_dma_sync_range() no-ops on abo->coherent). Kept as a
+ * separate GEM funcs set and allocator so the default cacheable path above stays
+ * untouched. No page array is built, so it is not PRIME-exportable (no
+ * .get_sg_table). Used to compare cache-sync (SYNC_BO) overhead against the
+ * cacheable backing.
+ */
+static void amdxdna_gem_coherent_obj_free(struct drm_gem_object *gobj)
+{
+	struct amdxdna_dev *xdna = to_xdna_dev(gobj->dev);
+	struct amdxdna_gem_obj *abo = to_xdna_obj(gobj);
+
+	amdxdna_dma_unmap_bo(xdna, abo);
+	dma_free_coherent(xdna->ddev.dev, abo->mem.size, abo->mem.kva,
+			  abo->cma_dma_addr);
+	drm_gem_object_release(gobj);
+	amdxdna_gem_destroy_obj(abo);
+}
+
+static int amdxdna_gem_coherent_obj_vmap(struct drm_gem_object *gobj, struct iosys_map *map)
+{
+	struct amdxdna_gem_obj *abo = to_xdna_obj(gobj);
+
+	/* The non-cacheable CPU address from dma_alloc_coherent(). */
+	iosys_map_set_vaddr(map, abo->mem.kva);
+	return 0;
+}
+
+static int amdxdna_gem_coherent_obj_mmap(struct drm_gem_object *gobj, struct vm_area_struct *vma)
+{
+	struct amdxdna_dev *xdna = to_xdna_dev(gobj->dev);
+	struct amdxdna_gem_obj *abo = to_xdna_obj(gobj);
+
+	/* drm_gem_mmap() encodes a fake buffer offset in vm_pgoff; rebase to 0. */
+	vma->vm_pgoff -= drm_vma_node_start(&gobj->vma_node);
+
+	/* dma_mmap_coherent() maps the non-cacheable region and sets prot itself. */
+	return dma_mmap_coherent(xdna->ddev.dev, vma, abo->mem.kva,
+				 abo->cma_dma_addr, vma->vm_end - vma->vm_start);
+}
+
+static const struct drm_gem_object_funcs amdxdna_gem_coherent_obj_funcs = {
+	.free = amdxdna_gem_coherent_obj_free,
+	.open = amdxdna_gem_obj_open,
+	.close = amdxdna_gem_obj_close,
+	.vmap = amdxdna_gem_coherent_obj_vmap,
+	.vunmap = amdxdna_gem_cma_obj_vunmap,
+	.mmap = amdxdna_gem_coherent_obj_mmap,
+	.vm_ops = &amdxdna_gem_cma_vm_ops,
+};
+
+static struct amdxdna_gem_obj *
+amdxdna_get_coherent_buf(struct drm_device *dev, struct amdxdna_drm_create_bo *args)
+{
+	struct amdxdna_dev *xdna = to_xdna_dev(dev);
+	struct device *cma_dev = xdna->ddev.dev;
+	size_t size = PAGE_ALIGN(args->size);
+	struct amdxdna_gem_obj *abo;
+	dma_addr_t dma_addr;
+	void *kva;
+	u64 align;
+	int ret;
+
+	if (!size) {
+		XDNA_ERR(xdna, "Invalid BO size 0x%llx", args->size);
+		return ERR_PTR(-EINVAL);
+	}
+
+	align = (args->type == AMDXDNA_BO_DEV_HEAP) ? xdna->dev_info->dev_mem_size : 0;
+	if (align > size)
+		size = roundup_pow_of_two(align);
+
+	kva = dma_alloc_coherent(cma_dev, size, &dma_addr, GFP_KERNEL);
+	if (!kva) {
+		XDNA_DBG(xdna, "Coherent CMA alloc failed on %s: size 0x%zx",
+			 dev_name(cma_dev), size);
+		return ERR_PTR(-ENOMEM);
+	}
+	/* dma_alloc_coherent() returns zeroed memory. */
+
+	abo = amdxdna_gem_create_obj(dev, size);
+	if (IS_ERR(abo)) {
+		ret = PTR_ERR(abo);
+		goto free_coherent;
+	}
+
+	abo->coherent = true;
+	abo->mem.kva = kva;
+	abo->cma_dma_addr = dma_addr;
+	/* Addressed by its own dma_addr; amdxdna_dma_map_bo() no-ops on a set addr. */
+	abo->mem.dma_addr = dma_addr;
+	abo->private_buffer = true;
+	abo->type = AMDXDNA_BO_SHARE;
+
+	to_gobj(abo)->funcs = &amdxdna_gem_coherent_obj_funcs;
+	drm_gem_private_object_init(dev, to_gobj(abo), size);
+
+	ret = drm_gem_create_mmap_offset(to_gobj(abo));
+	if (ret) {
+		XDNA_ERR(xdna, "Create mmap offset failed, ret %d", ret);
+		drm_gem_object_release(to_gobj(abo));
+		goto destroy_obj;
+	}
+
+	return abo;
+
+destroy_obj:
+	amdxdna_gem_destroy_obj(abo);
+free_coherent:
+	dma_free_coherent(cma_dev, size, kva, dma_addr);
+	return ERR_PTR(ret);
+}
+
 struct amdxdna_gem_obj *
 amdxdna_get_cma_buf(struct drm_device *dev, struct amdxdna_drm_create_bo *args)
 {
@@ -141,6 +256,10 @@ amdxdna_get_cma_buf(struct drm_device *dev, struct amdxdna_drm_create_bo *args)
 	struct page *page;
 	u64 align;
 	int ret;
+
+	/* Debug: route to the non-cacheable coherent backing when requested. */
+	if (xdna->cma_coherent)
+		return amdxdna_get_coherent_buf(dev, args);
 
 	if (!size) {
 		XDNA_ERR(xdna, "Invalid BO size 0x%llx", args->size);

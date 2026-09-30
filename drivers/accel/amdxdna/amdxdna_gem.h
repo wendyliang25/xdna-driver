@@ -62,8 +62,14 @@ struct amdxdna_gem_obj {
 	u32				assigned_hwctx;
 	struct dma_buf			*dma_buf;
 	struct dma_buf_attachment	*attach;
-	/* dma_alloc_pages() cookie for the CMA backing (amdxdna_cma_buf.c). */
+	/* dma_alloc_pages()/dma_alloc_coherent() cookie for the CMA backing. */
 	dma_addr_t			cma_dma_addr;
+	/*
+	 * Debug (debugfs "cma_coherent"): CMA backing came from
+	 * dma_alloc_coherent() -- non-cacheable, addressed by cma_dma_addr, needs no
+	 * cache sync. mem.kva holds the coherent CPU address; mem.pages is unset.
+	 */
+	bool				coherent;
 
 	/* True, if BO is managed by XRT, not application */
 	bool				internal;

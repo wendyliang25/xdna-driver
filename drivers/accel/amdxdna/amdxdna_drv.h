@@ -226,6 +226,14 @@ struct amdxdna_dev {
 	/* Allow auto core dump for hardware contexts, if true. */
 	bool				auto_coredump;
 
+	/*
+	 * Debug (debugfs "cma_coherent"): when true, CMA create-BOs are backed by
+	 * dma_alloc_coherent() (non-cacheable, no cache sync) instead of cacheable
+	 * dma_alloc_pages(). Read at BO allocation time; toggle between runs to
+	 * compare cache-maintenance (SYNC_BO) overhead. Only meaningful on CMA builds.
+	 */
+	bool				cma_coherent;
+
 	/* Back-pointer to the per-generation aie_device, set at DPT init so
 	 * common code (e.g. debugfs) can reach msg_ops without knowing the
 	 * generation-specific struct amdxdna_dev_hdl layout.

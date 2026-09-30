@@ -4,6 +4,7 @@
  */
 
 #include "amdxdna_cbuf.h"
+#include "amdxdna_cma_buf.h"
 #include "amdxdna_debugfs.h"
 #include "amdxdna_dpt.h"
 #include "amdxdna_pm.h"
@@ -376,6 +377,15 @@ void amdxdna_debugfs_init(struct amdxdna_dev *xdna)
 				    xdna,
 				    amdxdna_dbgfs_files[i].fops);
 	}
+
+	/*
+	 * Debug knob to back CMA create-BOs with non-cacheable coherent memory
+	 * (skips SYNC_BO) instead of cacheable pages, for comparing cache-sync
+	 * overhead. Only meaningful where CMA is the BO backing.
+	 */
+	if (amdxdna_use_cma(xdna))
+		debugfs_create_bool("cma_coherent", 0600, minor->debugfs_root,
+				    &xdna->cma_coherent);
 
 	if (xdna->dev_info->ops->debugfs_init)
 		xdna->dev_info->ops->debugfs_init(xdna);

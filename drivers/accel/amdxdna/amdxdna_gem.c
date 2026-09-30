@@ -1603,6 +1603,10 @@ int amdxdna_gem_dma_sync_range(struct amdxdna_gem_obj *abo, u64 offset, u64 size
 {
 	u64 end;
 
+	/* Non-cacheable coherent backing (debug): no cache maintenance needed. */
+	if (abo->coherent)
+		return 0;
+
 	if (offset >= abo->mem.size)
 		return -EINVAL;
 
