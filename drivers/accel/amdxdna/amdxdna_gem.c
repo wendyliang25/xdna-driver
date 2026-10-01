@@ -1492,28 +1492,19 @@ int amdxdna_drm_get_bo_info_ioctl(struct drm_device *dev, void *data, struct drm
 	return ret;
 }
 
-static int amdxdna_flush_bo(struct amdxdna_gem_obj *abo, u64 offset, u64 size)
+#ifdef CONFIG_X86
+/*
+ * SYNC_BO on x86: the NPU is a non-coherent master the DMA layer reports as
+ * coherent, so dma_sync_*() would no-op. Flush explicitly with drm_clflush (the
+ * x86 cache-maintenance primitive), which cleans and invalidates regardless of
+ * @dir.
+ */
+static int amdxdna_flush_bo_range(struct amdxdna_gem_obj *abo, u64 offset,
+				  u64 size, enum dma_data_direction dir)
 {
-	unsigned long first, nr_pages;
+	unsigned long first = offset >> PAGE_SHIFT;
+	unsigned long nr_pages = (PAGE_ALIGN(offset + size) >> PAGE_SHIFT) - first;
 	void *kva;
-	u64 end;
-
-	/* CMA create-BOs are coherent (dma_alloc_coherent); no cache maintenance. */
-	if (amdxdna_is_cma_bo(abo))
-		return 0;
-
-	if (offset >= abo->mem.size)
-		return -EINVAL;
-
-	if (check_add_overflow(offset, size, &end))
-		return -EINVAL;
-
-	size = min(abo->mem.size, end) - offset;
-	if (!size)
-		return 0;
-
-	first = offset >> PAGE_SHIFT;
-	nr_pages = (PAGE_ALIGN(offset + size) >> PAGE_SHIFT) - first;
 
 	kva = amdxdna_gem_vmap_try(abo);
 	if (!IS_ERR(kva))
@@ -1528,6 +1519,92 @@ static int amdxdna_flush_bo(struct amdxdna_gem_obj *abo, u64 offset, u64 size)
 		return -EINVAL;
 
 	return 0;
+}
+#else
+/*
+ * Cache-sync [offset, offset+size) of a device-mapped sg_table through the DMA
+ * API. Real cache maintenance happens only on a non-coherent device; on a
+ * coherent one each dma_sync_single_*() short-circuits. The sgt is mapped in
+ * buffer order, so a byte offset walks the DMA segment lengths.
+ */
+static void amdxdna_dma_sync_sgt(struct device *dev, struct sg_table *sgt,
+				 u64 offset, u64 size, enum dma_data_direction dir)
+{
+	u64 skip = offset;
+	u64 remaining = size;
+	struct scatterlist *sg;
+	int i;
+
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		unsigned int seg_len = sg_dma_len(sg);
+		u64 chunk_off, chunk_len;
+
+		if (!remaining)
+			break;
+		if (skip >= seg_len) {
+			skip -= seg_len;
+			continue;
+		}
+
+		chunk_off = skip;
+		chunk_len = min_t(u64, seg_len - chunk_off, remaining);
+		if (dir == DMA_FROM_DEVICE)
+			dma_sync_single_for_cpu(dev, sg_dma_address(sg) + chunk_off,
+						chunk_len, dir);
+		else
+			dma_sync_single_for_device(dev, sg_dma_address(sg) + chunk_off,
+						   chunk_len, dir);
+		remaining -= chunk_len;
+		skip = 0;
+	}
+}
+
+/*
+ * Elsewhere (the non-coherent platform) drm_clflush only WARNs, so maintain the
+ * BO's device-mapped sg_table through the DMA API -- kernel (EL1) cache ops work
+ * where user-space (EL0 DC CIVAC) may be disabled.
+ */
+static int amdxdna_flush_bo_range(struct amdxdna_gem_obj *abo, u64 offset,
+				  u64 size, enum dma_data_direction dir)
+{
+	struct device *dev = to_xdna_dev(to_gobj(abo)->dev)->ddev.dev;
+	struct sg_table *sgt;
+
+	sgt = amdxdna_gem_get_sgt(abo);
+	if (IS_ERR_OR_NULL(sgt))
+		return sgt ? PTR_ERR(sgt) : -EINVAL;
+
+	amdxdna_dma_sync_sgt(dev, sgt, offset, size, dir);
+
+	return 0;
+}
+#endif
+
+static int amdxdna_flush_bo(struct amdxdna_gem_obj *abo, u64 offset, u64 size,
+			    enum dma_data_direction dir)
+{
+	u64 end;
+
+	/*
+	 * Validate the range for every BO type before any early return, so an
+	 * out-of-range SYNC_BO is rejected consistently rather than silently
+	 * accepted on the CMA no-op path below.
+	 */
+	if (offset >= abo->mem.size)
+		return -EINVAL;
+
+	if (check_add_overflow(offset, size, &end))
+		return -EINVAL;
+
+	size = min(abo->mem.size, end) - offset;
+	if (!size)
+		return 0;
+
+	/* CMA create-BOs are coherent (dma_alloc_coherent); no cache maintenance. */
+	if (amdxdna_is_cma_bo(abo))
+		return 0;
+
+	return amdxdna_flush_bo_range(abo, offset, size, dir);
 }
 
 /*
@@ -1544,7 +1621,14 @@ int amdxdna_drm_sync_bo_ioctl(struct drm_device *dev,
 	struct amdxdna_drm_sync_bo *args = data;
 	struct amdxdna_gem_obj *abo;
 	struct drm_gem_object *gobj;
+	enum dma_data_direction dir;
 	int ret = 0;
+
+	if (args->direction != SYNC_DIRECT_TO_DEVICE &&
+	    args->direction != SYNC_DIRECT_FROM_DEVICE) {
+		XDNA_ERR(xdna, "Invalid sync direction %u", args->direction);
+		return -EINVAL;
+	}
 
 	gobj = drm_gem_object_lookup(filp, args->handle);
 	if (!gobj) {
@@ -1552,6 +1636,9 @@ int amdxdna_drm_sync_bo_ioctl(struct drm_device *dev,
 		return -ENOENT;
 	}
 	abo = to_xdna_obj(gobj);
+
+	dir = (args->direction == SYNC_DIRECT_FROM_DEVICE) ?
+		DMA_FROM_DEVICE : DMA_TO_DEVICE;
 
 	if (abo->type == AMDXDNA_BO_DEV) {
 		struct amdxdna_gem_obj *heap;
@@ -1569,7 +1656,8 @@ int amdxdna_drm_sync_bo_ioctl(struct drm_device *dev,
 			if (start >= end)
 				continue;
 
-			ret = amdxdna_flush_bo(heap, start - heap_start, end - start);
+			ret = amdxdna_flush_bo(heap, start - heap_start,
+					       end - start, dir);
 			if (ret) {
 				XDNA_ERR(xdna, "Failed to flush heap %ld ret %d",
 					 heap_id, ret);
@@ -1583,7 +1671,7 @@ int amdxdna_drm_sync_bo_ioctl(struct drm_device *dev,
 			goto put_obj;
 		}
 
-		ret = amdxdna_flush_bo(abo, args->offset, args->size);
+		ret = amdxdna_flush_bo(abo, args->offset, args->size, dir);
 		amdxdna_gem_unpin(abo);
 
 		if (ret) {
