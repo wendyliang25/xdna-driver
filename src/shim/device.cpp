@@ -1266,15 +1266,16 @@ struct archive_path
     switch (key) {
     case key_type::archive_path:
     {
-      const auto& pcie_id = xrt_core::device_query<xrt_core::query::pcie_id>(device);
       xrt_core::smi::smi_hardware_config smi_hrdw;
-      switch (smi_hrdw.get_family(pcie_id)) {
+      switch (smi_hrdw.get_family(device)) {
       case xrt_core::smi::smi_hardware_config::hardware_family::phoenix:
         return std::string("amdxdna/bins/xrt_smi_phx.a");
       case xrt_core::smi::smi_hardware_config::hardware_family::strix:
         return std::string("amdxdna/bins/xrt_smi_strx.a");
       case xrt_core::smi::smi_hardware_config::hardware_family::npu3:
         return std::string("amdxdna/bins/xrt_smi_npu3.a");
+      case xrt_core::smi::smi_hardware_config::hardware_family::aie2ps:
+        return std::string("amdxdna/bins/xrt_smi_ve2.a");
       default:
         throw xrt_core::generic_error(ENOTSUP, "Unsupported hardware type");
       }
