@@ -34,7 +34,9 @@ use_to_fw_debug_type(uint8_t use)
 }
 
 const uint64_t page_size = sysconf(_SC_PAGESIZE);
+#if defined(__x86_64__) || defined(_M_X64)
 const long cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+#endif
 
 bool
 is_power_of_two(size_t x)
@@ -126,40 +128,37 @@ to_hex_string(uint64_t num) {
   return ss.str();
 }
  
+// Userspace cache-line flush is x86-only. On aarch64, EL0 cache maintenance
+// (DC CIVAC) may trap when SCTLR_EL1.UCI is cleared and be silently dropped, so
+// it is unreliable; clflush_data() is a no-op there and that platform's cache
+// maintenance is routed through the driver instead.
+#if defined(__x86_64__) || defined(_M_X64)
 inline void flush_cache_line(const char *cur)
 {
-#if defined(__x86_64__) || defined(_M_X64)
   _mm_clflush(cur);
-#elif defined(__aarch64__)
-  asm volatile(
-    "DC CIVAC, %[addr]\n"  // Clean and invalidate data cache
-    "DSB SY\n"             // Data Synchronization Barrier
-    "ISB SY\n"             // Instruction Synchronization Barrier
-    :
-    : [addr] "r" (cur)
-    : "memory"
-  );
-#endif
 }
+#endif
 
-// flash cache line for non coherent memory
+// flush cache lines for non coherent memory (x86 only; no-op on aarch64)
 inline void
 clflush_data(const void *base, size_t offset, size_t len)
 {
+#if defined(__x86_64__) || defined(_M_X64)
   const char *cur = (const char *)base;
   cur += offset;
   uintptr_t lastline = (uintptr_t)(cur + len - 1) | (cacheline_size - 1);
-#if defined(__x86_64__) || defined(_M_X64)
   // x86 CLFLUSH is not ordered vs younger loads; fence so the flush is globally
   // observed before the host reads the line back (cf. kernel clflush_cache_range).
   _mm_mfence();
-#endif
   do {
     flush_cache_line(cur);
     cur += cacheline_size;
   } while (cur <= (const char *)lastline);
-#if defined(__x86_64__) || defined(_M_X64)
   _mm_mfence();
+#else
+  (void)base;
+  (void)offset;
+  (void)len;
 #endif
 }
 
