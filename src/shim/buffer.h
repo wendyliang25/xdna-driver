@@ -112,6 +112,14 @@ public:
 
   uint64_t get_flags() const;
 
+  // True if the BO wraps memory the driver did not allocate as coherent DMA
+  // memory -- an imported dmabuf or a user-pointer BO. On a non-coherent device
+  // such memory is cacheable and needs explicit cache maintenance; a
+  // driver-allocated BO is backed by coherent (non-cacheable) memory and does
+  // not.
+  bool
+  externally_backed() const;
+
   virtual std::set<bo_id>
   get_arg_bo_ids() const;
 
@@ -124,9 +132,6 @@ public:
 protected:
   const pdev& m_pdev;
 
-  void
-  sync_by_driver(direction dir, size_t size, size_t offset);
-
 private:
   std::string
   describe() const;
@@ -138,6 +143,7 @@ private:
   std::unique_ptr<mmap_ptr> m_range_addr = nullptr;
   std::vector< std::unique_ptr<drm_bo> > m_bos;
   void *m_uptr = nullptr;
+  bool m_imported = false;
   int m_type = AMDXDNA_BO_INVALID;
   size_t m_alignment = 1;
   size_t m_total_size = 0;

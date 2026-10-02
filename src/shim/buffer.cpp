@@ -10,9 +10,6 @@
 #include "buffer.h"
 #include "shim_debug.h"
 #include "core/common/config_reader.h"
-#if defined(__x86_64__) || defined(_M_X64)
-#include <x86intrin.h>
-#endif
 
 namespace {
 
@@ -34,9 +31,6 @@ use_to_fw_debug_type(uint8_t use)
 }
 
 const uint64_t page_size = sysconf(_SC_PAGESIZE);
-#if defined(__x86_64__) || defined(_M_X64)
-const long cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
-#endif
 
 bool
 is_power_of_two(size_t x)
@@ -128,48 +122,6 @@ to_hex_string(uint64_t num) {
   return ss.str();
 }
  
-// Userspace cache-line flush is x86-only. On aarch64, EL0 cache maintenance
-// (DC CIVAC) may trap when SCTLR_EL1.UCI is cleared and be silently dropped, so
-// it is unreliable; clflush_data() is a no-op there and that platform's cache
-// maintenance is routed through the driver instead.
-#if defined(__x86_64__) || defined(_M_X64)
-inline void flush_cache_line(const char *cur)
-{
-  _mm_clflush(cur);
-}
-#endif
-
-// flush cache lines for non coherent memory (x86 only; no-op on aarch64)
-inline void
-clflush_data(const void *base, size_t offset, size_t len)
-{
-#if defined(__x86_64__) || defined(_M_X64)
-  const char *cur = (const char *)base;
-  cur += offset;
-  uintptr_t lastline = (uintptr_t)(cur + len - 1) | (cacheline_size - 1);
-  // x86 CLFLUSH is not ordered vs younger loads; fence so the flush is globally
-  // observed before the host reads the line back (cf. kernel clflush_cache_range).
-  _mm_mfence();
-  do {
-    flush_cache_line(cur);
-    cur += cacheline_size;
-  } while (cur <= (const char *)lastline);
-  _mm_mfence();
-#else
-  (void)base;
-  (void)offset;
-  (void)len;
-#endif
-}
-
-bool
-is_driver_sync()
-{
-  static bool drv_sync =
-    xrt_core::config::detail::get_bool_value("Debug.force_driver_sync", false);
-  return drv_sync;
-}
-
 bool
 is_driver_pin_arg_bo()
 {
@@ -424,6 +376,7 @@ buffer(const pdev& dev, size_t size, int type, void *uptr)
 buffer::
 buffer(const pdev& dev, xrt_core::shared_handle::export_handle ehdl)
   : m_pdev(dev)
+  , m_imported(true)
   , m_type(AMDXDNA_BO_SHARE)
 {
   auto bo = std::make_unique<drm_bo>(dev, ehdl);
@@ -615,6 +568,13 @@ get_flags() const
   return m_flags;
 }
 
+bool
+buffer::
+externally_backed() const
+{
+  return m_imported || m_uptr != nullptr;
+}
+
 std::string
 buffer::
 describe() const
@@ -646,37 +606,13 @@ describe() const
 
 void
 buffer::
-sync_by_driver(direction dir, size_t sz, size_t offset)
-{
-  if (offset > size() || sz > size() - offset)
-    shim_err(EINVAL, "Invalid BO offset and size for sync'ing: %ld, %ld", offset, sz);
-
-  sync_bo_arg arg = {
-    .bo = id(),
-    .direction = dir,
-    .offset = offset,
-    .size = sz,
-  };
-  m_pdev.drv_ioctl(drv_ioctl_cmd::sync_bo, &arg);
-  shim_debug("Sync'ed BO %d in driver: offset=%ld, size=%ld", id().handle, offset, sz);
-}
-
-void
-buffer::
 sync(direction dir, size_t sz, size_t offset)
 {
-  if (m_pdev.is_cache_coherent())
-    return;
-
-  if (is_driver_sync()) {
-    sync_by_driver(dir, sz, offset);
-    return;
-  }
-
   if (offset > size() || sz > size() - offset)
     shim_err(EINVAL, "Invalid BO offset and size for sync'ing: %ld, %ld", offset, sz);
-  clflush_data(vaddr(), offset, sz); 
-  shim_debug("Sync'ed BO %d: offset=%ld, size=%ld", id().handle, offset, sz);
+  // The device decides whether cache maintenance is needed (its coherency
+  // policy) and, if so, how -- see pdev::sync_bo() / pdev::cache_sync().
+  m_pdev.sync_bo(*this, dir, sz, offset);
 }
 
 std::set<bo_id>
@@ -865,10 +801,13 @@ void
 dbg_buffer::
 sync(direction dir, size_t sz, size_t offset)
 {
+  // A debug BO's device2host reads always go through the driver, regardless of
+  // the device's coherency policy; host2device follows the normal path. Both
+  // paths validate the range (buffer::sync() / pdev::driver_sync_bo()).
   if (dir == xrt_core::buffer_handle::direction::host2device)
     buffer::sync(dir, sz, offset);
   else
-    buffer::sync_by_driver(dir, sz, offset);
+    m_pdev.driver_sync_bo(*this, dir, sz, offset);
 }
 
 //
