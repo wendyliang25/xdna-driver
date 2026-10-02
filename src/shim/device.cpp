@@ -78,6 +78,11 @@ static constexpr uint16_t NPU3_DEVICE_IDS[] = {
   0x17f1, 0x17f2, 0x17f3, 0x1b0a, 0x1b0b, 0x1b0c
 };
 static constexpr uint16_t NPU4_DEVICE_ID = 0x17f0;
+// The of_plat (non-PCI) aie2ps/npu12 part has no real PCI device id; it is
+// identified by its device-tree part-number string. Report this fixed synthetic
+// id for the legacy numeric device-id queries (pcie_device) and the non-zero
+// platform is_aie4 check.
+static constexpr uint16_t AIE2PS_PLATFORM_DEVICE_ID = 0x1234;
 
 static bool
 is_aie4(uint16_t device_id)
@@ -185,29 +190,16 @@ struct sysfs_fcn<std::string>
   }
 };
 
-// A non-PCI amdxdna part carries its device id in the device-tree compatible,
-// as "amd,xdna-<hex-id>" (exposed at <dev>/of_node/compatible); this is the
-// device's own id, not an XRT invention.  Parse and return it, or 0 if no such
-// compatible is present.  The sysfs node is a NUL-separated list, so the id
-// token ends at the following NUL.
+static std::string
+platform_device_id_str(const std::shared_ptr<xrt_core::pci::dev>& pdev);
+
+// A platform (non-PCI) amdxdna part has no real PCI device id; it is identified
+// by its device-tree part-number string (platform_device_id_str).  Return a
+// fixed synthetic id for such a part, or 0 when there is none (e.g. a PCI part).
 static uint16_t
 platform_device_id(const std::shared_ptr<xrt_core::pci::dev>& pdev)
 {
-  std::string compat;
-  try {
-    compat = sysfs_fcn<std::string>::get(pdev, "", "of_node/compatible");
-  }
-  catch (const xrt_core::query::sysfs_error&) {
-    return 0;
-  }
-
-  static const std::string prefix = "amd,xdna-";
-  auto pos = compat.find(prefix);
-  if (pos == std::string::npos)
-    return 0;
-
-  return static_cast<uint16_t>(
-    std::strtoul(compat.c_str() + pos + prefix.size(), nullptr, 16));
+  return platform_device_id_str(pdev).empty() ? 0 : AIE2PS_PLATFORM_DEVICE_ID;
 }
 
 // The of_plat npu12 part also carries a human-readable silicon part number in
