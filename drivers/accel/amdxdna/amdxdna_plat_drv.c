@@ -299,12 +299,12 @@ static const struct dev_pm_ops amdxdna_plat_pm_ops = {
 };
 
 /*
- * The device tree names the part by its id, "amd,xdna-<hex-id>" (amd,xdna-1234
- * for the aie2ps/npu12 part).  Match on that id and add a match entry per
- * supported part; userspace reads the id from the same compatible.
+ * Platform amdxdna parts are identified by their silicon part number in the
+ * device-tree compatible (e.g. "xlnx,xc2ve3858"), which userspace also reads
+ * for display. All are aie2ps/npu12; add a match entry per supported part.
  */
 static const struct of_device_id amdxdna_plat_of_match[] = {
-	{ .compatible = "amd,xdna-1234", .data = &dev_npu12_info },
+	{ .compatible = "xlnx,xc2ve3858", .data = &dev_npu12_info },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, amdxdna_plat_of_match);
