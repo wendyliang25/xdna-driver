@@ -865,6 +865,10 @@ int xdna_mailbox_send_msg(struct mailbox_channel *mailbox_chann,
 		return ret;
 	}
 
+	/* Dump the outgoing request, mirroring the PCI transport's req data dump. */
+	print_hex_dump_debug("req data: ", DUMP_PREFIX_OFFSET, 16, 4,
+			     msg->send_data, msg->send_size, false);
+
 	ret = plat_ring_mgmt_produce(mb->tx_hdr, mb->tx_ring, mb->mgmt_ring_mask,
 				     &hdr, msg->send_data, msg->send_size,
 				     &mb->tx_head_cached);
