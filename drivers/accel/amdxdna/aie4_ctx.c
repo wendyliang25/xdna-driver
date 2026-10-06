@@ -1803,6 +1803,7 @@ static int aie4_hwctx_cfg_debug_bo(struct amdxdna_hwctx *hwctx, u32 meta_bo_hdl,
 	struct amdxdna_gem_obj *meta_bo;
 	struct amdxdna_gem_obj *log_bo;
 	u32 prev_size = 0;
+	bool trunc_warned = false;
 	u64 base_addr;
 	u32 property;
 	u32 num_ucs;
@@ -1856,12 +1857,6 @@ static int aie4_hwctx_cfg_debug_bo(struct amdxdna_hwctx *hwctx, u32 meta_bo_hdl,
 		goto put_meta_bo;
 	}
 
-	if (num_ucs > AIE4_MAX_NUM_CERTS) {
-		XDNA_ERR(xdna, "num_ucs %u exceeds %d", num_ucs, AIE4_MAX_NUM_CERTS);
-		ret = -EINVAL;
-		goto put_meta_bo;
-	}
-
 	if (meta_bo->mem.size < struct_size(meta, uc_info, num_ucs)) {
 		XDNA_ERR(xdna, "meta bo size %lu too small for %u ucs",
 			 meta_bo->mem.size, num_ucs);
@@ -1883,10 +1878,22 @@ static int aie4_hwctx_cfg_debug_bo(struct amdxdna_hwctx *hwctx, u32 meta_bo_hdl,
 		u32 next_size;
 
 		index = meta->uc_info[i].index;
+		/*
+		 * CERT logging is bounded by the fixed firmware wire array
+		 * (cl.info[], AIE4_MAX_NUM_CERTS entries). A full-array context can
+		 * span more CERTs than that array carries, so program the ones that
+		 * fit and skip the rest with a single warning rather than failing
+		 * the whole attach.
+		 */
 		if (index >= AIE4_MAX_NUM_CERTS) {
-			XDNA_ERR(xdna, "Invalid uc index %u", index);
-			ret = -EINVAL;
-			goto put_log_bo;
+			if (!trunc_warned) {
+				XDNA_DBG(xdna,
+					 "CERT logging truncated: uc index %u >= max %d (num_ucs %u); logging only the first %d CERT(s)",
+					 index, AIE4_MAX_NUM_CERTS, num_ucs,
+					 AIE4_MAX_NUM_CERTS);
+				trunc_warned = true;
+			}
+			continue;
 		}
 
 		if (!attach) {
@@ -1918,7 +1925,8 @@ static int aie4_hwctx_cfg_debug_bo(struct amdxdna_hwctx *hwctx, u32 meta_bo_hdl,
 		prev_size = next_size;
 	}
 
-	cl.num = FIELD_PREP(AIE4_MSG_CERT_LOG_NUM, attach ? num_ucs : 0);
+	cl.num = FIELD_PREP(AIE4_MSG_CERT_LOG_NUM,
+			    attach ? min_t(u32, num_ucs, AIE4_MAX_NUM_CERTS) : 0);
 
 	ret = aie4_configure_hw_context_cert_log(ndev, hwctx->priv->hw_ctx_id,
 						 property, &cl);
